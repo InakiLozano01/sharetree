@@ -1,0 +1,130 @@
+THIRD-PARTY NOTICES
+===================
+
+sharetree is MIT-licensed (see LICENSE). It contains code ported or adapted from
+the MIT-licensed projects below; their copyright and permission notices are
+reproduced as their licenses require.
+
+Ideas only, no code: huntharo/git (PwrGit's git fork, GPL-2.0) and the upstream
+git "worktree add --reflink" patch (GPL-2.0). From their design documents we took
+the re-fstat of the donor after cloning, FIDEDUPERANGE re-sharing with a FIEMAP
+"already shared" check, and the list of edge cases. No GPL code was copied.
+
+------------------------------------------------------------------------------
+josharian/git-cow-worktree  (https://github.com/josharian/git-cow-worktree, read at commit 0f6852c)
+
+Ported to Rust: the v2 index writer (src/index.rs, from index.go), the add flow
+(--no-checkout, clone, verify, seeded index, `checkout -f HEAD`, retry on a
+rejected index, post-checkout via `git hook run`; src/add.rs, from main.go,
+clone.go, validate.go, seed.go, tree.go, worktree.go), and the shape of the
+drop-in invariant test scenarios (tests/dropin.rs, from e2e_test.go).
+
+MIT License
+
+Copyright (c) 2026 Josh Bleecher Snyder
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+leostera/git-twig  (https://github.com/leostera/git-twig, read at commit f32ebe1)
+
+Adapted: the FIDEDUPERANGE ioctl layout and 16 MiB chunking (src/linux.rs, from
+crates/git-twig/src/sharing.rs); donor scoring by matching (path, blob) entries,
+conversion-attribute delegation and `hash-object --no-filters` verification
+(design ideas from RFD0012/0015/0016/0024).
+
+MIT License
+
+Copyright (c) 2026 Leandro Ostera
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+lukeed/lane  (https://github.com/lukeed/lane, read at commit 3cebe2c)
+
+Adapted: the errno classification for "this filesystem cannot reflink"
+(src/reflink.rs, from crates/lane/src/cow.rs), the 4 KiB probe, absolute-symlink
+retargeting for cloned caches and the park-then-sweep removal (src/warm.rs,
+src/rm.rs, from cow.rs and worktree.rs).
+
+MIT License
+
+Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
+can1357/oh-my-pi  (https://github.com/can1357/oh-my-pi, read at commit 21d93e4)
+
+Adapted: the non-relocatable cache rules (directories holding pyvenv.cfg or
+CMakeCache.txt, untracked .env files) and "clone holes" for other worktrees
+(src/warm.rs, from crates/vcs/src/git/mutate.rs).
+
+MIT License
+
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2025-2026 Can Bölük
+Copyright (c) 2026 Stencil Labs, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+------------------------------------------------------------------------------
+Test data: tests/data/shattered-1-prefix.bin
+
+The first 320 bytes of shattered-1.pdf from the SHAttered SHA-1 collision
+(Stevens, Bursztein, Karpman, Albertini, Markov; https://shattered.io), as
+shipped in the test data of the sha1-checked crate (RustCrypto, MIT OR
+Apache-2.0). Used only to check that SHA-1 collision detection is wired up.

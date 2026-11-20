@@ -1,0 +1,23 @@
+pkgbase = sharetree
+	pkgdesc = Copy-on-write git worktrees: reflink unchanged tracked files, verify every byte, let git write the rest
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/InakiLozano01/sharetree
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	depends = git
+	depends = gcc-libs
+	depends = glibc
+	optdepends = btrfs-progs: Btrfs volumes for filesystems without reflinks (sharetree setup volume)
+	optdepends = xfsprogs: XFS volumes (sharetree setup volume --fs xfs)
+	optdepends = udisks2: mount the volume without root
+	optdepends = fuse-overlayfs: overlay worktrees (sharetree add --overlay)
+	provides = sharetree
+	conflicts = sharetree-bin
+	options = !lto
+	source = sharetree-0.1.0.tar.gz::https://github.com/InakiLozano01/sharetree/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = sharetree

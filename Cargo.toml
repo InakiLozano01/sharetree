@@ -1,0 +1,50 @@
+[package]
+name = "sharetree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Copy-on-write git worktrees: reflink unchanged tracked files from an existing worktree, verify every byte, let git write the rest"
+readme = "README.md"
+repository = "https://github.com/InakiLozano01/sharetree"
+homepage = "https://github.com/InakiLozano01/sharetree"
+keywords = ["git", "worktree", "reflink", "copy-on-write", "btrfs"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "sharetree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sharetree"
+path = "src/main.rs"
+
+# Same program under the name git looks for, so `git sharetree add ...` works.
+[[bin]]
+name = "git-sharetree"
+path = "src/bin/git-sharetree.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+sha1-checked = { version = "0.10", default-features = false, features = ["std"] }
+sha2 = "0.10"
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

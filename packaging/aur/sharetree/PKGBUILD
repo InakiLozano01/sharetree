@@ -1,0 +1,54 @@
+# Maintainer: InakiLozano01 <REPLACE-WITH-EMAIL>
+#
+# Built from the tagged source. Before publishing a version: set pkgver,
+# replace the checksum (or run `updpkgsums`), and regenerate .SRCINFO with
+# `makepkg --printsrcinfo > .SRCINFO`.
+pkgname=sharetree
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Copy-on-write git worktrees: reflink unchanged tracked files, verify every byte, let git write the rest'
+arch=('x86_64' 'aarch64')
+url='https://github.com/InakiLozano01/sharetree'
+license=('MIT')
+depends=('git' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=(
+  'btrfs-progs: Btrfs volumes for filesystems without reflinks (sharetree setup volume)'
+  'xfsprogs: XFS volumes (sharetree setup volume --fs xfs)'
+  'udisks2: mount the volume without root'
+  'fuse-overlayfs: overlay worktrees (sharetree add --overlay)'
+)
+provides=('sharetree')
+conflicts=('sharetree-bin')
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Placeholder: replace with the tag archive's checksum before publishing.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Unit tests only: the integration tests need reflink filesystems, udisks
+  # and a desktop session, and skip themselves elsewhere anyway.
+  cargo test --frozen --lib
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/sharetree target/release/git-sharetree -t "$pkgdir/usr/bin/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 LICENSE THIRD_PARTY_NOTICES -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

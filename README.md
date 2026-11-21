@@ -500,7 +500,13 @@ Native Windows CI checks checkout contents, clean Git status, and edit
 isolation with `--no-cow` and `--windows-clone` on the runner's temporary
 filesystem. The smoke test accepts a plain Git fallback. Region splitting,
 alignment, and FILETIME-to-index stat mapping have unit tests on every
-platform. Execution on a real ReFS volume is still pending.
+platform.
+
+The Windows ReFS workflow provisions a disposable ReFS volume with 4 KiB
+allocation units on a GitHub-hosted Windows Server 2025 runner. It requires
+the regression below to pass as evidence of Server ReFS block cloning and
+Git-equivalent checkout behavior. Windows 11 Dev Drive setup, beyond-EOF
+behavior, and physical extent sharing require separate verification.
 
 To run the ReFS regression, set `SHARETREE_TEST_REFS_DIR` to an existing,
 writable directory on a ReFS volume with block cloning enabled. The test
@@ -530,13 +536,15 @@ need checkout conversion. Binary or `-text` files can be cloned.
 | Linux | ext4, tmpfs, NFS, ... | plain `git worktree add` plus a hint (tmpfs and ext4 tested) | nothing copied | no | FIEMAP estimate or n/a |
 | Linux | ext4 etc. **with `sharetree setup volume`** | `--into-volume` / `auto_volume` / the prompt: reflink inside a Btrfs or XFS loop image, with a seed donor (both tested, including ext4) | reflink inside the volume | FIDEDUPERANGE inside the volume | `btrfs filesystem du` / FIEMAP |
 | Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (tested on Linux) | — | no | upper dir size |
-| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped (native CI requires the xattr regression) | reflink | not yet | not measurable (use `df`) |
+| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped | reflink | not yet | not measurable (use `df`) |
 | Windows | NTFS | plain `git worktree add` plus a hint | — | no | not measurable |
 | Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | Plain checkout with `--into-volume`, block cloning with `--windows-clone` (ReFS execution pending) | — | no | not measurable |
 
-Native macOS CI sets `SHARETREE_REQUIRE_APFS=1` so a failed clone probe fails
-the xattr regression. Local runs can skip that test if the temporary
-filesystem cannot clone.
+Native macOS CI sets `SHARETREE_REQUIRE_APFS=1`. The CLI identity test requires
+an APFS fixture, 15 verified clones, and a checkout equivalent to stock Git.
+The separate xattr regression requires a working clone probe and verifies that
+the clone strips extended attributes. Local runs with the gate unset can skip
+these tests when their fixtures lack filesystem support.
 
 The dependency advisor (`doctor`, and the hint after `add`) works everywhere.
 sharetree has no ProjFS or hardlink backend: hardlinked tracked files leak

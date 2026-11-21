@@ -1,0 +1,38 @@
+name: Linux filesystems
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux-${{ matrix.filesystem }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - filesystem: btrfs
+            tools: btrfs-progs
+          - filesystem: xfs
+            tools: xfsprogs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install filesystem tools
+        env:
+          FILESYSTEM_TOOLS: ${{ matrix.tools }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y "$FILESYSTEM_TOOLS"
+      - name: Run native filesystem scenarios
+        env:
+          FILESYSTEM: ${{ matrix.filesystem }}
+        run: bash scripts/test-linux-filesystems.sh "$FILESYSTEM"

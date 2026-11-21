@@ -546,6 +546,12 @@ The separate xattr regression requires a working clone probe and verifies that
 the clone strips extended attributes. Local runs with the gate unset can skip
 these tests when their fixtures lack filesystem support.
 
+Hosted Linux CI uses separate Btrfs and XFS loop images to check verified
+clones, stock Git parity, and write isolation. The Btrfs job also checks
+exclusive bytes and warm-cache rollback. The XFS job uses a separate tmpfs
+mount to check stock Git fallback within tmpfs and from XFS to tmpfs, and
+verifies that `--warm` leaves caches behind on tmpfs.
+
 The dependency advisor (`doctor`, and the hint after `add`) works everywhere.
 sharetree has no ProjFS or hardlink backend: hardlinked tracked files leak
 edits between worktrees under VS Code's and Vim's default save paths.

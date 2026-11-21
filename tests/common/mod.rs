@@ -14,6 +14,10 @@ pub fn require_btrfs() -> bool {
     std::env::var("SHARETREE_REQUIRE_BTRFS").as_deref() == Ok("1")
 }
 
+fn require_xfs() -> bool {
+    std::env::var("SHARETREE_REQUIRE_XFS").as_deref() == Ok("1")
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn fs_type(p: &Path) -> String {
     let out = Command::new("stat")
@@ -74,14 +78,21 @@ impl Sandbox {
     fn native_fixture(filesystems: &[&str]) -> Option<Sandbox> {
         let sb = Sandbox::home();
         let t = fs_type(sb.root());
-        if require_btrfs() {
+        let required = if require_btrfs() {
+            Some("btrfs")
+        } else if require_xfs() {
+            Some("xfs")
+        } else {
+            None
+        };
+        if let Some(expected) = required {
             assert_eq!(
                 t,
-                "btrfs",
-                "SHARETREE_REQUIRE_BTRFS=1 requires a Btrfs fixture at {}",
+                expected,
+                "required {expected} fixture at {}",
                 sb.root().display()
             );
-            eprintln!("Btrfs fixture: {}", sb.root().display());
+            eprintln!("{expected} fixture: {}", sb.root().display());
         }
         if filesystems.contains(&t.as_str()) {
             Some(sb)
@@ -95,12 +106,33 @@ impl Sandbox {
     }
 
     pub fn tmpfs() -> Option<Sandbox> {
-        let t = fs_type(Path::new("/tmp"));
+        let fixture = std::env::var_os("SHARETREE_TEST_TMPFS_DIR");
+        assert!(
+            !require_xfs() || fixture.is_some(),
+            "SHARETREE_REQUIRE_XFS=1 requires SHARETREE_TEST_TMPFS_DIR"
+        );
+        let base = fixture.as_deref().map_or(Path::new("/tmp"), Path::new);
+        let t = fs_type(base);
         if t != "tmpfs" {
-            eprintln!("SKIP: /tmp is {t}, not tmpfs");
+            assert!(
+                fixture.is_none(),
+                "SHARETREE_TEST_TMPFS_DIR requires tmpfs at {}, found {t:?}",
+                base.display()
+            );
+            eprintln!("SKIP: {} is {t}, not tmpfs", base.display());
             return None;
         }
-        Some(Sandbox::new_in(Path::new("/tmp")))
+        let sb = Sandbox::new_in(base);
+        if fixture.is_some() {
+            assert_eq!(
+                fs_type(sb.root()),
+                "tmpfs",
+                "fixture at {}",
+                sb.root().display()
+            );
+            eprintln!("tmpfs fixture: {}", sb.root().display());
+        }
+        Some(sb)
     }
 
     pub fn config_path(&self) -> PathBuf {

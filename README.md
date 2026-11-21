@@ -30,9 +30,11 @@ sharetree: reflinked 62408 of 97371 files (1.5 GiB) from /src/linux; git wrote t
 
 ## Install
 
-**Release binaries** (Linux x86_64/aarch64 static musl, macOS x86_64/arm64,
-Windows x86_64) are attached to each
-[GitHub release](https://github.com/InakiLozano01/sharetree/releases):
+**Release binaries** will be available from
+[GitHub Releases](https://github.com/InakiLozano01/sharetree/releases) after the
+first tag ships. The workflow builds Linux x86_64/aarch64 static musl,
+macOS x86_64/arm64, and Windows x86_64 archives. These commands verify and
+install a Linux or macOS archive once it is available.
 
 ```sh
 v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, ...
@@ -43,9 +45,9 @@ tar xzf "sharetree-v$v-$target.tar.gz"
 install -m755 "sharetree-v$v-$target"/{sharetree,git-sharetree} ~/.local/bin/
 ```
 
-**Arch Linux (AUR):** `sharetree-bin` (release binaries) or `sharetree`
-(built from source), e.g. `yay -S sharetree-bin`. The PKGBUILDs live in
-[`packaging/aur/`](packaging/aur).
+**Arch Linux (AUR):** Package templates for `sharetree-bin` (release binaries)
+and `sharetree` (source) live in [`packaging/aur/`](packaging/aur). They still
+need the first release's checksums and an Arch package build.
 
 **From source** (stable Rust ≥ 1.89; sharetree is not on crates.io yet):
 
@@ -525,7 +527,15 @@ files, 51 MB) and torvalds/linux (97,371 files, 1.68 GB). Scripts:
 with the load average) and [`bench/bench.sh`](bench/bench.sh) (adds the
 first `git status` and exclusive bytes). "old" is the previous version of
 this code (clone everything, then `git hash-object` in 8 processes, then
-check out); "new" is the current one.
+check out); "new" is the first published source revision, 871ca1b.
+
+The comparison script accepts one argument per program with `label=program`.
+Use `--tool` to pass arguments or environment values containing spaces.
+
+```sh
+bench/compare.sh ~/src/linux 5 --tool stock git \
+  --tool sharetree env SHARETREE_NO_PROMPT=1 '/path/to/sharetree build'
+```
 
 **Controlled: XFS image on tmpfs** (no disk, no compression, no encryption;
 median of 5 alternating runs):

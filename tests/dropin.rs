@@ -32,7 +32,20 @@ fn compare_at(sb: &Sandbox, from: &Path, rev: &str, stock: &str, cow: &str) -> S
 
 #[test]
 fn identity() {
-    let Some(sb) = Sandbox::reflink() else { return };
+    let sb = if std::env::var("SHARETREE_REQUIRE_APFS").as_deref() == Ok("1") {
+        let sb = Sandbox::home();
+        let root = sb.root();
+        assert_eq!(
+            fs_type(root),
+            "apfs",
+            "SHARETREE_REQUIRE_APFS=1 requires the CLI identity fixture at {} to be on APFS",
+            root.display()
+        );
+        sb
+    } else {
+        let Some(sb) = Sandbox::reflink() else { return };
+        sb
+    };
     let main = sb.repo("main", &[]);
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
     assert_eq!(reflinked(&err), 15, "{err}");

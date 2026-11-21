@@ -414,7 +414,10 @@ pub fn run(donor: &Path, dest: &Path, wts: &[Worktree], quiet: bool, trace: &Tra
             Abort::Io(e) => {
                 cleanup
                     .with_context(|| format!("--warm cleanup failed after clone error ({e:#})"))?;
-                bail!("--warm failed (partial clones removed): {e:#}");
+                bail!(
+                    "--warm failed (partial clones removed): {e:#}\nfile clones rolled back = {}",
+                    st.files
+                );
             }
         }
     }

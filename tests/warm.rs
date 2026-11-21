@@ -128,33 +128,8 @@ fn warm_policy_selects_and_skips() {
 }
 
 #[cfg(target_os = "linux")]
-fn watch_file_access(path: &Path) -> fs::File {
-    use std::ffi::CString;
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    assert!(
-        fd >= 0,
-        "inotify_init1: {}",
-        std::io::Error::last_os_error()
-    );
-    let watch = unsafe { fs::File::from_raw_fd(fd) };
-    let descriptor = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_ACCESS) };
-    assert!(
-        descriptor >= 0,
-        "inotify_add_watch: {}",
-        std::io::Error::last_os_error()
-    );
-    watch
-}
-
-#[cfg(target_os = "linux")]
 #[test]
 fn warm_rollback_removes_clones_from_a_tracked_directory() {
-    use std::os::fd::AsRawFd;
-
     let Some(sb) = Sandbox::btrfs() else { return };
     let main = sb.repo("main", &[]);
     write(&main.join(".gitignore"), b"/tracked/cache/\n/z-long-link\n");
@@ -207,7 +182,6 @@ fn warm_rollback_removes_clones_from_a_tracked_directory() {
     }
     std::os::unix::fs::symlink(main.join("x".repeat(min_padding)), long_link).unwrap();
     let dest = sb.p("rollback");
-    let watch = watch_file_access(&artifact_path);
     let out = sb.sharetree(
         &main,
         &[
@@ -226,25 +200,20 @@ fn warm_rollback_removes_clones_from_a_tracked_directory() {
         "{err}"
     );
     assert!(
+        err.lines()
+            .any(|line| line == "file clones rolled back = 1"),
+        "{err}"
+    );
+    assert!(
         err.contains(&format!("(os error {})", libc::ENAMETOOLONG)),
         "{err}"
     );
 
-    let mut event = std::mem::MaybeUninit::<libc::inotify_event>::uninit();
-    let event_size = std::mem::size_of::<libc::inotify_event>();
-    let n = unsafe { libc::read(watch.as_raw_fd(), event.as_mut_ptr().cast(), event_size) };
-    assert_eq!(
-        n,
-        event_size as isize,
-        "the warm clone should access the donor artifact before the symlink fails: {}",
-        std::io::Error::last_os_error()
-    );
-    assert_eq!(unsafe { event.assume_init() }.mask, libc::IN_ACCESS);
     assert_eq!(fs::read(dest.join("tracked/original")).unwrap(), b"keep\n");
     assert_eq!(mode(dest.join("tracked")), tracked_mode);
     assert!(!dest.join("tracked/cache").exists());
     assert_eq!(fs::read(artifact_path).unwrap(), artifact);
-    eprintln!("{warm_report}{err}Warm donor artifact accessed before rollback");
+    eprint!("{warm_report}{err}");
 }
 
 #[test]

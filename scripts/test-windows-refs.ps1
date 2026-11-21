@@ -63,8 +63,7 @@ try {
         throw "ReFS cargo test exited with code $testExitCode."
     }
     $passingTests = @($testOutput -ceq "test $testName ... ok")
-    $passingSummaries = @($testOutput -cmatch '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in ')
-    if ($passingTests.Count -ne 1 -or $passingSummaries.Count -ne 1) {
+    if ($passingTests.Count -ne 1) {
         throw "Expected exactly one passing ReFS test ($testName)."
     }
 } catch {

@@ -96,7 +96,7 @@ sharetree setup volume|devdrive|status|mount|teardown|auto ...
 | `--into-volume` | Put the worktree in the sharetree volume and leave a symlink at `<path>`. See below. |
 | `--no-volume` | Never use the volume, even with `auto_volume = true`. |
 | `--overlay` | Linux, opt-in: a fuse-overlayfs worktree over a shared base checkout. See [Overlay worktrees](#linux-overlay-worktrees---overlay). |
-| `--windows-clone` | Windows, experimental and untested: ReFS / Dev Drive block cloning (also `windows_clone = true` in the config). See [Windows](#windows-block-cloning-experimental-untested). |
+| `--windows-clone` | Experimental ReFS / Dev Drive block cloning on Windows (also `windows_clone = true` in the config). See [Windows](#windows-block-cloning-experimental). |
 | `-v` | Show the donor, the plan and how long each step took. `SHARETREE_TRACE=1` does the same. |
 
 **`rm`** applies `git worktree remove`'s checks. It refuses a worktree with
@@ -473,7 +473,7 @@ script has **not been run** on Windows.
 worktree data before deleting it. Use `--force` to delete a detached image
 or an image that still holds worktree data.
 
-### Windows block cloning (experimental, untested)
+### Windows block cloning (experimental)
 
 **Off by default.** `sharetree add --windows-clone ...`, or `windows_clone =
 true` in `%APPDATA%\sharetree\config.toml`, runs the same engine as on Linux
@@ -496,12 +496,28 @@ notes:
   and gid are 0, and there is no exec bit;
 - every clone is still hashed against its blob before it enters the index.
 
-**Status:** it compiles for `x86_64-pc-windows-gnu` (clippy-clean), and the
-platform-independent parts (region splitting and alignment, FILETIME to
-index stat mapping) are unit-tested on every platform. It has **never been
-run on Windows**. With Git for Windows' default `core.autocrlf = true`, text
-files are converted on checkout, so git writes those and only binary or
-`-text` files are cloned.
+Native Windows CI checks checkout contents, clean Git status, and edit
+isolation with `--no-cow` and `--windows-clone` on the runner's temporary
+filesystem. The smoke test accepts a plain Git fallback. Region splitting,
+alignment, and FILETIME-to-index stat mapping have unit tests on every
+platform. Execution on a real ReFS volume is still pending.
+
+To run the ReFS regression, set `SHARETREE_TEST_REFS_DIR` to an existing,
+writable directory on a ReFS volume with block cloning enabled. The test
+creates and cleans up a temporary repository and both worktrees inside that
+directory using your normal user account. In PowerShell, run
+
+```powershell
+$env:SHARETREE_TEST_REFS_DIR = 'D:\path\to\existing-directory'
+cargo test --locked --test windows refs_worktree_uses_verified_clones_and_keeps_edits_isolated -- --ignored --exact
+```
+
+The regression checks the filesystem type, requires one verified clone,
+compares the checkout and index with stock Git, and checks that editing the
+clone leaves the donor unchanged.
+
+With Git for Windows' default `core.autocrlf = true`, Git writes files that
+need checkout conversion. Binary or `-text` files can be cloned.
 
 ## Platform matrix
 
@@ -514,9 +530,13 @@ files are converted on checkout, so git writes those and only binary or
 | Linux | ext4, tmpfs, NFS, ... | plain `git worktree add` plus a hint (tmpfs and ext4 tested) | nothing copied | no | FIEMAP estimate or n/a |
 | Linux | ext4 etc. **with `sharetree setup volume`** | `--into-volume` / `auto_volume` / the prompt: reflink inside a Btrfs or XFS loop image, with a seed donor (both tested, including ext4) | reflink inside the volume | FIDEDUPERANGE inside the volume | `btrfs filesystem du` / FIEMAP |
 | Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (tested on Linux) | — | no | upper dir size |
-| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped (compiles; untested) | reflink | not yet | not measurable (use `df`) |
+| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped (native CI requires the xattr regression) | reflink | not yet | not measurable (use `df`) |
 | Windows | NTFS | plain `git worktree add` plus a hint | — | no | not measurable |
-| Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | `--into-volume`: plain checkout; with `--windows-clone`, block cloning (compiles, unit-tested math; never run) | — | no | not measurable |
+| Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | Plain checkout with `--into-volume`, block cloning with `--windows-clone` (ReFS execution pending) | — | no | not measurable |
+
+Native macOS CI sets `SHARETREE_REQUIRE_APFS=1` so a failed clone probe fails
+the xattr regression. Local runs can skip that test if the temporary
+filesystem cannot clone.
 
 The dependency advisor (`doctor`, and the hint after `add`) works everywhere.
 sharetree has no ProjFS or hardlink backend: hardlinked tracked files leak
@@ -534,6 +554,8 @@ check out); "new" is the first published source revision, 871ca1b.
 
 The comparison script accepts one argument per program with `label=program`.
 Use `--tool` to pass arguments or environment values containing spaces.
+Inside a `--tool` group, write `--tool ''` to pass a literal `--tool` argument.
+Start the next group with `--tool <label> <program>`.
 
 ```sh
 bench/compare.sh ~/src/linux 5 --tool stock git \
@@ -589,7 +611,7 @@ a final `git checkout` that sometimes takes 0.3 s for no work.
 ## Limitations and roadmap
 
 - **Not yet:**
-  - running Windows block cloning on a real ReFS Dev Drive;
+  - running the opt-in Windows regression on a real ReFS volume;
   - kernel overlayfs in a user namespace (`sharetree exec`), ProjFS, and an
     opt-in hardlink backend;
   - growing a volume (`truncate` plus a filesystem resize, which needs

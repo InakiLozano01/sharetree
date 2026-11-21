@@ -659,21 +659,24 @@ fn reference_transaction_hook_delegates() {
 }
 
 #[test]
-fn registration_lock_failure_uses_stock_checkout() {
+fn registration_lock_failure_stops_quiet_add_before_registration() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
-    let stock = sb.p("stock");
-    let cow = sb.p("cow");
-    sb.git(
-        &main,
-        &["worktree", "add", "--detach", &stock.to_string_lossy()],
-    );
+    let dest = sb.p("cow");
+    let worktrees = sb.git(&main, &["worktree", "list", "--porcelain"]);
     fs::create_dir(main.join(".git/sharetree-register.lock")).unwrap();
 
-    let err = sb.sharetree_ok(&main, &["add", "--detach", &cow.to_string_lossy()]);
+    let out = sb.sharetree(&main, &["add", "-q", "-b", "cow", &dest.to_string_lossy()]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("cannot lock worktree registration"), "{err}");
-    assert!(err.contains("running plain `git worktree add`"), "{err}");
-    assert_equivalent(&sb, &stock, &cow);
+    assert!(err.contains("sharetree-register.lock"), "{err}");
+    assert!(!dest.exists());
+    assert_eq!(
+        sb.git(&main, &["worktree", "list", "--porcelain"]),
+        worktrees
+    );
+    assert!(sb.git(&main, &["branch", "--list", "cow"]).is_empty());
 }
 
 #[test]

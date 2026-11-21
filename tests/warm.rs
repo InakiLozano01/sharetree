@@ -127,6 +127,67 @@ fn warm_policy_selects_and_skips() {
     assert!(!cow.join("debug.log").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn warm_rollback_removes_clones_from_a_tracked_directory() {
+    let sb = Sandbox::home();
+    if fs_type(sb.root()) != "btrfs" {
+        eprintln!("SKIP: the rollback fixture requires Btrfs symlink limits");
+        return;
+    }
+    let main = sb.repo("main", &[]);
+    write(&main.join(".gitignore"), b"/tracked/cache/\n/z-long-link\n");
+    write(&main.join("tracked/original"), b"keep\n");
+    sb.commit_all(&main, "track the cache parent");
+
+    let cache = main.join("tracked/cache");
+    let artifact = bytes(17, 8192);
+    write(&cache.join("artifact"), &artifact);
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o750)).unwrap();
+
+    let warmed = sb.p("warmed");
+    sb.sharetree_ok(
+        &main,
+        &["add", "--warm", "--detach", warmed.to_str().unwrap()],
+    );
+    assert_eq!(
+        fs::read(warmed.join("tracked/cache/artifact")).unwrap(),
+        artifact
+    );
+    let mode = |path| fs::metadata(path).unwrap().mode() & 0o7777;
+    assert_eq!(mode(warmed.join("tracked/cache")), 0o750);
+    let tracked_mode = mode(warmed.join("tracked"));
+
+    let max_target_len = libc::PATH_MAX as usize - 1;
+    let padding = max_target_len - main.as_os_str().len() - 1;
+    std::os::unix::fs::symlink(main.join("x".repeat(padding)), main.join("z-long-link")).unwrap();
+    let dest = sb.p("rollback");
+    let out = sb.sharetree(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            main.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("--warm failed (partial clones removed)"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("(os error {})", libc::ENAMETOOLONG)),
+        "{err}"
+    );
+    assert_eq!(fs::read(dest.join("tracked/original")).unwrap(), b"keep\n");
+    assert_eq!(mode(dest.join("tracked")), tracked_mode);
+    assert!(!dest.join("tracked/cache").exists());
+}
+
 #[test]
 fn warm_skips_other_worktrees_nested_in_the_donor() {
     let Some(sb) = Sandbox::reflink() else { return };

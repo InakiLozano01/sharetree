@@ -236,7 +236,14 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let dir = tempfile::tempdir().unwrap();
-        if super::super::probe(dir.path()).is_err() {
+        if let Err(error) = super::super::probe(dir.path()) {
+            assert_ne!(
+                std::env::var("SHARETREE_REQUIRE_APFS").as_deref(),
+                Ok("1"),
+                "APFS clone probe failed in {}: {error}",
+                dir.path().display()
+            );
+            eprintln!("skipping APFS xattr test: {error}");
             return;
         }
         let src = dir.path().join("src");
@@ -258,8 +265,12 @@ mod tests {
             };
             assert_eq!(result, 0, "{}", io::Error::last_os_error());
         }
-        let src = open_source(&src).unwrap();
-        let _clone = clone_into_new(&src, &src.metadata().unwrap(), &dst, 0o600).unwrap();
+        let attrs = unsafe { libc::listxattr(source.as_ptr(), std::ptr::null_mut(), 0, 0) };
+        assert!(
+            attrs > 4096,
+            "expected more than 4 KiB of source xattr names, got {attrs}"
+        );
+        super::super::clone_tracked(&src, &dst, 0o600, PROBE_LEN as u64).unwrap();
         let dest = CString::new(dst.as_os_str().as_bytes()).unwrap();
         let attrs = unsafe { libc::listxattr(dest.as_ptr(), std::ptr::null_mut(), 0, 0) };
         assert_eq!(attrs, 0);

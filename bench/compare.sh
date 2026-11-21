@@ -2,6 +2,7 @@
 set -euo pipefail
 if (( $# < 3 )) || [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
   echo "usage: $0 <repo> <rounds> <label>=<program>... | --tool <label> <program> [args]..." >&2
+  echo "within a tool group, use --tool '' to pass a literal --tool argument" >&2
   exit 2
 fi
 repo=$(cd "$1" && pwd -P)
@@ -45,9 +46,17 @@ run_round() {
       (( $# >= 3 )) || { echo "--tool needs a label and a program" >&2; return 2; }
       shift 2
       args=()
-      while (( $# )) && [[ $1 != --tool ]]; do
-        args+=("$1")
-        shift
+      while (( $# )); do
+        if [[ $1 == --tool ]]; then
+          if (( $# < 2 )) || [[ -n $2 ]]; then
+            break
+          fi
+          args+=(--tool)
+          shift 2
+        else
+          args+=("$1")
+          shift
+        fi
       done
       run_tool "$label" "${args[@]}"
     else

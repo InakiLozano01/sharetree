@@ -455,29 +455,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rollback_removes_entries_created_inside_existing_directories() {
+    fn rollback_removes_created_symlinks_and_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path();
-        fs::create_dir(dest.join("tracked")).unwrap();
+        let donor = dir.path().join("donor");
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(donor.join("tracked/cache")).unwrap();
+        std::os::unix::fs::symlink("asset", donor.join("tracked/cache/link")).unwrap();
+        fs::create_dir_all(dest.join("tracked")).unwrap();
         let original = dest.join("tracked/original");
         fs::write(&original, "keep").unwrap();
-        let created = dest.join("tracked/new-cache");
-        fs::create_dir(&created).unwrap();
-        let copy = created.join("copy");
-        fs::write(&copy, "cached").unwrap();
 
         let mut ctx = Ctx {
-            donor: dest,
+            donor: &donor,
             donor_spellings: vec![],
-            dest,
+            dest: &dest,
             holes: vec![],
             clone: vec![],
             skip: vec![],
-            created: vec![(created.clone(), true), (copy, false)],
+            created: vec![],
         };
+        assert!(ctx.select(b"tracked/cache", &mut Stats::default()).is_ok());
+        assert_eq!(
+            fs::read_link(dest.join("tracked/cache/link")).unwrap(),
+            Path::new("asset")
+        );
         ctx.rollback(0).unwrap();
         assert_eq!(fs::read(original).unwrap(), b"keep");
-        assert!(!created.exists());
+        assert!(!dest.join("tracked/cache").exists());
     }
 
     #[test]

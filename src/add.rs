@@ -776,17 +776,17 @@ mod engine {
         }
         let lock = match register_lock(cwd) {
             Ok(lock) => lock,
-            Err(e) => {
-                let detail = if e
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::Unsupported)
-                {
-                    format!("filesystem locking is unavailable for worktree registration: {e:#}")
-                } else {
-                    format!("cannot lock worktree registration: {e:#}")
-                };
-                return delegate(a, cwd, &detail);
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::Unsupported) =>
+            {
+                return delegate(
+                    a,
+                    cwd,
+                    &format!("filesystem locking is unavailable for worktree registration: {e:#}"),
+                );
             }
+            Err(e) => return Err(e.context("cannot lock worktree registration")),
         };
         let explicit = a.from.is_some();
         let t = Instant::now();

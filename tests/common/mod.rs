@@ -10,6 +10,10 @@ use std::process::{Command, Output, Stdio};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_sharetree");
 
+pub fn require_btrfs() -> bool {
+    std::env::var("SHARETREE_REQUIRE_BTRFS").as_deref() == Ok("1")
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn fs_type(p: &Path) -> String {
     let out = Command::new("stat")
@@ -60,14 +64,31 @@ impl Sandbox {
     }
 
     pub fn reflink() -> Option<Sandbox> {
+        Sandbox::native_fixture(&["btrfs", "xfs", "apfs"])
+    }
+
+    pub fn btrfs() -> Option<Sandbox> {
+        Sandbox::native_fixture(&["btrfs"])
+    }
+
+    fn native_fixture(filesystems: &[&str]) -> Option<Sandbox> {
         let sb = Sandbox::home();
         let t = fs_type(sb.root());
-        if matches!(t.as_str(), "btrfs" | "xfs" | "apfs") {
+        if require_btrfs() {
+            assert_eq!(
+                t,
+                "btrfs",
+                "SHARETREE_REQUIRE_BTRFS=1 requires a Btrfs fixture at {}",
+                sb.root().display()
+            );
+            eprintln!("Btrfs fixture: {}", sb.root().display());
+        }
+        if filesystems.contains(&t.as_str()) {
             Some(sb)
         } else {
             eprintln!(
-                "SKIP: {} is {t}, not a reflink filesystem",
-                sb.root().display()
+                "SKIP: {} is {t}, requires one of {filesystems:?}",
+                sb.root().display(),
             );
             None
         }
@@ -327,21 +348,26 @@ pub fn reflinked(stderr: &str) -> usize {
 }
 
 pub fn btrfs_exclusive(paths: &[PathBuf]) -> Option<u64> {
-    let _ = Command::new("sync").status();
+    if !Command::new("sync").status().ok()?.success() {
+        return None;
+    }
     let out = Command::new("btrfs")
         .args(["filesystem", "du", "-s", "--raw"])
         .args(paths)
         .output()
         .ok()?;
     if !out.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sum = 0;
+    let mut rows = 0;
     for l in text.lines().skip(1) {
         sum += l.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        rows += 1;
     }
-    Some(sum)
+    (rows == paths.len()).then_some(sum)
 }
 
 pub fn content_paths(root: &Path) -> Vec<PathBuf> {

@@ -61,6 +61,7 @@ fn writes_do_not_leak_between_worktrees() {
             & 0o777,
         0o644
     );
+    eprintln!("{err}Write and mode changes stayed private to each worktree");
 }
 
 fn exclusive(sb_path: &Path) -> Option<u64> {
@@ -69,11 +70,7 @@ fn exclusive(sb_path: &Path) -> Option<u64> {
 
 #[test]
 fn btrfs_exclusive_bytes_are_near_zero() {
-    let Some(sb) = Sandbox::reflink() else { return };
-    if fs_type(sb.root()) != "btrfs" {
-        eprintln!("SKIP: not btrfs");
-        return;
-    }
+    let Some(sb) = Sandbox::btrfs() else { return };
     let main = big_repo(&sb);
     sb.git(
         &main,
@@ -86,19 +83,26 @@ fn btrfs_exclusive_bytes_are_near_zero() {
         ],
     );
     let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("cow").to_string_lossy()]);
+    assert!(reflinked(&err) > 0, "{err}");
     let Some(stock) = exclusive(&sb.p("stock")) else {
+        assert!(!require_btrfs(), "`btrfs filesystem du` is required");
         eprintln!("SKIP: `btrfs filesystem du` unavailable");
         return;
     };
-    let cow = exclusive(&sb.p("cow")).unwrap();
+    let cow = exclusive(&sb.p("cow")).expect("measure Btrfs exclusive bytes for cloned worktree");
     eprintln!("exclusive: stock={stock} cow={cow}\n{err}");
     assert!(stock > 15 * 1024 * 1024, "stock exclusive {stock}");
     assert!(cow < 256 * 1024, "cow exclusive {cow}");
 
     let out = sb.sharetree(&sb.p("cow"), &["du", "--raw"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let line = String::from_utf8_lossy(&out.stdout).into_owned();
     let excl: u64 = line.split('\t').nth(1).unwrap().parse().unwrap();
-    assert!(excl < 256 * 1024, "{line}");
+    assert_eq!(excl, cow, "{line}");
     let apparent: u64 = line.split('\t').next().unwrap().parse().unwrap();
     assert!(
         apparent > 15 * 1024 * 1024,

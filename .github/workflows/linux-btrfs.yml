@@ -1,0 +1,25 @@
+name: Linux Btrfs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-btrfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Btrfs tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y btrfs-progs
+      - name: Run native Btrfs scenarios
+        run: bash scripts/test-linux-btrfs.sh

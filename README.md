@@ -172,7 +172,7 @@ donor scoring:
 
 1. **Preflight.** These cases go straight to plain `git worktree add`:
    - `--no-checkout` or `--orphan`;
-   - `core.splitIndex`, or `GIT_INDEX_FILE` set;
+   - `core.splitIndex`, or an explicit Git repository, worktree, index or object-store override;
    - a `reference-transaction` or `post-index-change` hook;
    - no donor on the same device;
    - Windows, unless `--windows-clone` / `windows_clone = true`.
@@ -180,10 +180,10 @@ donor scoring:
    destination. It does not trust filesystem names: XFS can be made without
    reflink support, OpenZFS gates its block cloning behind a setting, and
    overlayfs depends on the filesystem underneath.
-3. **Register.** It runs `git worktree add --no-checkout <your args>`, and
-   meanwhile ranks donors by how many `(path, blob)` entries they share with
-   the target commit. A donor whose tracked files are mostly modified is
-   skipped, since it is probably still in the middle of a checkout.
+3. **Register.** It runs `git worktree add --no-checkout <your args>` and
+   ranks donors by how many target files they can supply by blob ID. The
+   final ranking excludes donor paths with local edits. A worktree with
+   mostly modified files is likely still being populated and is skipped.
 4. **Plan.** A target file is cloned only when all of these hold:
    - it is a regular file of at least `--min-size` bytes;
    - a donor file with the same blob is unmodified (matched by blob id, so
@@ -205,13 +205,13 @@ donor scoring:
    match too, and the stat data must not move while the file is read. Any
    mismatch is deleted.
 7. **Seed the index.** sharetree writes a version 2 index listing only the
-   verified files, with their real stat data. This is the step that keeps the
-   sharing: without it, `git checkout` rewrites every clone (the research
-   notes measured 48 MiB exclusive instead of 0).
-8. **Finish.** `git checkout -f HEAD` (parallel checkout) writes everything
-   else. If git rejects the seeded index, sharetree deletes it and checks out
-   from scratch. `git hook run post-checkout` then gets the same arguments
-   `git worktree add` would pass.
+   verified files, with their real stat data. Git can leave those files in place
+   and preserve their shared blocks.
+8. **Finish.** `git reset --hard --no-recurse-submodules` writes the remaining
+   files, as in `git worktree add`. If Git rejects the seeded index, sharetree
+   retries with an empty index. A failed population rolls back the worktree
+   registration. `git hook run post-checkout` then gets the stock arguments. A
+   failing hook returns its exit code and leaves the completed worktree in place.
 
 **Why the clones are re-read.** A reflinked file starts with an empty page
 cache, even when the donor is cached, so hashing it reads the data from disk
@@ -402,7 +402,7 @@ space freed inside the volume flows back to the host after a few minutes.
 An opt-in alternative to the volume, for when a loop image is not wanted:
 `sharetree add --overlay <path> [<commit-ish>]` (any `git worktree add`
 options too) mounts a **fuse-overlayfs** worktree at `<path>`. It needs
-`fuse-overlayfs` (≥ 1.18 recommended: it fixed CVE-2026-77478), `fusermount3`
+`fuse-overlayfs` 1.18 or later (includes the fix for CVE-2026-77478), `fusermount3`
 and `/dev/fuse`; no root.
 
 - **Lower layer:** one immutable *base* checkout per commit, a detached,
@@ -440,10 +440,8 @@ and `/dev/fuse`; no root.
   **3–6x slower** than on plain ext4;
 - the worktree exists only while mounted.
 
-Use the volume for heavy builds. **Status:** unit-tested (mount options,
-version check, unit file, lock reasons) and the end-to-end test is written,
-but fuse-overlayfs is not installed on the development host, so that test
-skips there and overlay mode has **not been run**.
+Use the volume for heavy builds. Overlay creation, remounting and removal
+are tested end to end on Linux with fuse-overlayfs.
 
 ### Windows: `sharetree setup devdrive`
 
@@ -465,6 +463,10 @@ without running it. The script:
 Without `--windows-clone` these are full checkouts that get Dev Drive's
 faster I/O. The script generator is unit-tested on every platform, but the
 script has **not been run** on Windows.
+
+`setup teardown --delete-image` checks the attached image for managed
+worktree data before deleting it. Use `--force` to delete a detached image
+or an image that still holds worktree data.
 
 ### Windows block cloning (experimental, untested)
 
@@ -506,7 +508,7 @@ files are converted on checkout, so git writes those and only binary or
 | Linux | OpenZFS ≥ 2.2 with block cloning on | reflink if the probe succeeds; an EAGAIN on dirty data means git writes that file (untested here) | reflink | depends on the kernel | FIEMAP estimate |
 | Linux | ext4, tmpfs, NFS, ... | plain `git worktree add` plus a hint (tmpfs and ext4 tested) | nothing copied | no | FIEMAP estimate or n/a |
 | Linux | ext4 etc. **with `sharetree setup volume`** | `--into-volume` / `auto_volume` / the prompt: reflink inside a Btrfs or XFS loop image, with a seed donor (both tested, including ext4) | reflink inside the volume | FIDEDUPERANGE inside the volume | `btrfs filesystem du` / FIEMAP |
-| Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (written; not run here: fuse-overlayfs missing) | — | no | upper dir size |
+| Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (tested on Linux) | — | no | upper dir size |
 | macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped (compiles; untested) | reflink | not yet | not measurable (use `df`) |
 | Windows | NTFS | plain `git worktree add` plus a hint | — | no | not measurable |
 | Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | `--into-volume`: plain checkout; with `--windows-clone`, block cloning (compiles, unit-tested math; never run) | — | no | not measurable |
@@ -574,8 +576,7 @@ a final `git checkout` that sometimes takes 0.3 s for no work.
 ## Limitations and roadmap
 
 - **Not yet:**
-  - running Windows block cloning and overlay mode on real systems (both
-    are written, neither has been run);
+  - running Windows block cloning on a real ReFS Dev Drive;
   - kernel overlayfs in a user namespace (`sharetree exec`), ProjFS, and an
     opt-in hardlink backend;
   - growing a volume (`truncate` plus a filesystem resize, which needs

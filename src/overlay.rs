@@ -37,9 +37,9 @@ use std::path::{Path, PathBuf};
 pub const LOCK_PREFIX: &str = "sharetree overlay";
 pub const BASE_LOCK_REASON: &str =
     "sharetree overlay base: read-only lower layer of overlay worktrees; do not edit";
+const BASE_PREPARING_LOCK: &str = "sharetree overlay base: checkout in progress";
 pub const UNIT_NAME: &str = "sharetree-overlays.service";
-/// fuse-overlayfs 1.18 fixed CVE-2026-77478 (hardlinked lower files
-/// resolving to the wrong layer); older versions only get a warning.
+/// fuse-overlayfs 1.18 fixed CVE-2026-77478.
 pub const MIN_VERSION: (u32, u32) = (1, 18);
 
 pub fn lock_reason(name: &str) -> String {
@@ -49,11 +49,11 @@ pub fn lock_reason(name: &str) -> String {
 }
 
 pub fn is_overlay_lock(reason: Option<&str>) -> bool {
-    reason.is_some_and(|r| r.starts_with(LOCK_PREFIX) && r != BASE_LOCK_REASON)
+    reason.is_some_and(|r| r.starts_with(LOCK_PREFIX) && !is_base_lock(Some(r)))
 }
 
 pub fn is_base_lock(reason: Option<&str>) -> bool {
-    reason == Some(BASE_LOCK_REASON)
+    matches!(reason, Some(BASE_LOCK_REASON | BASE_PREPARING_LOCK))
 }
 
 /// Where a repository's bases and overlay worktrees live.
@@ -114,9 +114,10 @@ pub fn mount_args(lower: &Path, upper: &Path, work: &Path, mountpoint: &Path) ->
 /// Parse `fuse-overlayfs --version` ("fuse-overlayfs: version 1.18").
 pub fn parse_version(out: &str) -> Option<(u32, u32)> {
     let v = out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("fuse-overlayfs: version "))?
         .split_whitespace()
-        .skip_while(|w| *w != "version")
-        .nth(1)?;
+        .next()?;
     let mut it = v.split('.').map(|x| {
         x.chars()
             .take_while(char::is_ascii_digit)
@@ -127,6 +128,18 @@ pub fn parse_version(out: &str) -> Option<(u32, u32)> {
         it.next()?.ok()?,
         it.next().and_then(Result::ok).unwrap_or(0),
     ))
+}
+
+fn validate_fuse_version(success: bool, text: &str) -> Result<(), String> {
+    match (success, parse_version(text)) {
+        (true, Some(version)) if version >= MIN_VERSION => Ok(()),
+        _ => {
+            Err(format!(
+            "fuse-overlayfs {}.{} or newer is required (CVE-2026-77478); --version reported {:?}",
+            MIN_VERSION.0, MIN_VERSION.1, text.trim()
+        ))
+        }
+    }
 }
 
 /// systemd user unit that remounts every overlay worktree at login.
@@ -186,62 +199,70 @@ mod linux {
 
     use super::*;
     use crate::add::AddArgs;
-    use crate::config::{self, Config, OverlayEntry};
+    use crate::config::{self, Config, OverlayEntry, OverlayPhase};
     use crate::util::{self, human};
     use crate::{git, volume};
 
     fn fuse_overlayfs() -> Result<PathBuf> {
-        if let Some(p) = std::env::var_os("SHARETREE_FUSE_OVERLAYFS").filter(|v| !v.is_empty()) {
-            return Ok(PathBuf::from(p));
-        }
-        volume::find_in_path("fuse-overlayfs").ok_or_else(|| {
-            anyhow!(
-                "--overlay needs fuse-overlayfs (package fuse-overlayfs), which is not installed"
-            )
-        })
+        let bin = std::env::var_os("SHARETREE_FUSE_OVERLAYFS")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| volume::find_in_path("fuse-overlayfs"))
+            .context(
+                "--overlay needs fuse-overlayfs (package fuse-overlayfs), which is not installed",
+            )?;
+        let out = Command::new(&bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", bin.display()))?;
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        validate_fuse_version(out.status.success(), &text).map_err(|failure| anyhow!(failure))?;
+        Ok(bin)
     }
 
     /// fuse-overlayfs, fusermount3 and /dev/fuse, or why not.
-    pub fn prerequisites() -> Result<PathBuf> {
-        let bin = fuse_overlayfs()?;
+    fn prerequisites() -> Result<()> {
+        fuse_overlayfs()?;
         if volume::find_in_path("fusermount3").is_none() {
             bail!("--overlay needs fusermount3 (package fuse3)");
         }
         if !Path::new("/dev/fuse").exists() {
             bail!("--overlay needs /dev/fuse (is the fuse module loaded?)");
         }
-        let out = Command::new(&bin)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("running {}", bin.display()))?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned()
-            + &String::from_utf8_lossy(&out.stderr);
-        match parse_version(&text) {
-            Some(v) if v < MIN_VERSION => eprintln!(
-                "sharetree: warning: fuse-overlayfs {}.{} is older than {}.{}, which fixed \
-                 CVE-2026-77478 (hardlinked lower files resolving to the wrong layer)",
-                v.0, v.1, MIN_VERSION.0, MIN_VERSION.1
-            ),
-            Some(_) => {}
-            None => eprintln!(
-                "sharetree: warning: cannot tell the fuse-overlayfs version from {:?}",
-                text.trim()
-            ),
-        }
-        Ok(bin)
+        Ok(())
     }
 
-    pub fn is_mounted(path: &Path) -> bool {
+    #[derive(Debug, PartialEq, Eq)]
+    enum MountState {
+        Unmounted,
+        Mounted,
+        Occupied,
+    }
+
+    fn mount_state(path: &Path) -> Result<MountState> {
         let want = util::canon(path);
-        volume::mounts()
-            .iter()
-            .any(|m| m.mountpoint == want && m.fstype.contains("fuse-overlayfs"))
+        let mut state = MountState::Unmounted;
+        for m in volume::mounts()? {
+            if m.mountpoint == want {
+                if !m.fstype.contains("fuse-overlayfs") {
+                    return Ok(MountState::Occupied);
+                }
+                state = MountState::Mounted;
+            }
+        }
+        Ok(state)
     }
 
-    pub fn mount(e: &OverlayEntry) -> Result<()> {
-        if is_mounted(&e.path) {
-            return Ok(());
+    fn mount(e: &OverlayEntry) -> Result<()> {
+        match mount_state(&e.path)? {
+            MountState::Mounted => return Ok(()),
+            MountState::Occupied => bail!("another filesystem is mounted on {}", e.path.display()),
+            MountState::Unmounted => {}
         }
         for d in [&e.lower, &e.upper] {
             if !d.is_dir() {
@@ -270,7 +291,7 @@ mod linux {
             );
         }
         let t = Instant::now();
-        while !is_mounted(&e.path) {
+        while mount_state(&e.path)? != MountState::Mounted {
             if t.elapsed() > Duration::from_secs(5) {
                 bail!("{} did not appear as a mount", e.path.display());
             }
@@ -279,9 +300,11 @@ mod linux {
         Ok(())
     }
 
-    pub fn unmount(path: &Path) -> Result<()> {
-        if !is_mounted(path) {
-            return Ok(());
+    fn unmount(path: &Path) -> Result<()> {
+        match mount_state(path)? {
+            MountState::Unmounted => return Ok(()),
+            MountState::Occupied => bail!("another filesystem is mounted on {}", path.display()),
+            MountState::Mounted => {}
         }
         let out = Command::new("fusermount3")
             .arg("-u")
@@ -289,6 +312,9 @@ mod linux {
             .stdin(Stdio::null())
             .output()
             .context("running fusermount3")?;
+        if mount_state(path)? == MountState::Unmounted {
+            return Ok(());
+        }
         if !out.status.success() {
             bail!(
                 "fusermount3 -u {}: {}",
@@ -296,7 +322,7 @@ mod linux {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(())
+        bail!("{} is still mounted after `fusermount3 -u`", path.display())
     }
 
     /// Delete a tree that may contain the kernel's or fuse's `d---------`
@@ -346,6 +372,25 @@ mod linux {
         (name.len() >= 40 && name.bytes().all(|b| b.is_ascii_hexdigit())).then(|| name.into())
     }
 
+    fn lifecycle_lock() -> Result<fs::File> {
+        let path = config::config_path()
+            .context("cannot locate a config directory (set HOME or XDG_CONFIG_HOME)")?
+            .with_extension("overlay.lock");
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        lock.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(lock)
+    }
+
     /// A base for `commit`: the exact one if it exists, else the existing
     /// base whose tree differs least when that is under 5 % of the files
     /// (git then writes the differences into the upper dir), else a new one.
@@ -356,12 +401,17 @@ mod linux {
         quiet: bool,
     ) -> Result<(PathBuf, String)> {
         let wts = git::list_worktrees(cwd)?;
-        let registered = |p: &Path| {
-            wts.iter()
-                .any(|w| util::canon(&w.path) == util::canon(p) && p.join(".git").is_file())
+        let ready = |p: &Path, commit: &str| {
+            wts.iter().any(|w| {
+                util::canon(&w.path) == util::canon(p)
+                    && w.lock_reason.as_deref() == Some(BASE_LOCK_REASON)
+                    && w.detached
+                    && w.head.as_deref() == Some(commit)
+                    && p.join(".git").is_file()
+            })
         };
         let exact = layout.base(commit);
-        if registered(&exact) {
+        if ready(&exact, commit) {
             return Ok((exact, commit.to_string()));
         }
         let total = git::ls_tree(cwd, commit)?.entries.len().max(1);
@@ -369,7 +419,7 @@ mod linux {
         for e in fs::read_dir(layout.bases()).into_iter().flatten().flatten() {
             let p = e.path();
             let Some(c) = base_commit(&p) else { continue };
-            if !registered(&p) {
+            if !ready(&p, &c) {
                 continue;
             }
             let Ok(out) = git::output(cwd, &["diff", "--name-only", "-z", &c, commit]) else {
@@ -385,10 +435,18 @@ mod linux {
                 return Ok((p, c));
             }
         }
-        if exact.symlink_metadata().is_ok() {
-            remove_tree(&exact)?;
+        if let Some(wt) = wts
+            .iter()
+            .find(|w| util::canon(&w.path) == util::canon(&exact))
+        {
+            if wt.lock_reason.as_deref() != Some(BASE_PREPARING_LOCK) {
+                bail!(
+                    "{} is registered but is not a usable overlay base",
+                    exact.display()
+                );
+            }
+            remove_base(cwd, &exact)?;
         }
-        let _ = git::output(cwd, &["worktree", "prune"]);
         fs::create_dir_all(layout.bases())?;
         if !quiet {
             eprintln!(
@@ -407,7 +465,7 @@ mod linux {
                 "--detach",
                 "--lock",
                 "--reason",
-                BASE_LOCK_REASON,
+                BASE_PREPARING_LOCK,
             ])
             .arg(&exact)
             .arg(commit)
@@ -418,6 +476,11 @@ mod linux {
             bail!("creating the overlay base {} failed", exact.display());
         }
         settle_index(&exact)?;
+        let admin = crate::rm::admin_dir(&exact)?;
+        let lock = admin.join("locked");
+        let prepared = admin.join("sharetree-base-ready");
+        fs::write(&prepared, BASE_LOCK_REASON)?;
+        fs::rename(&prepared, &lock)?;
         Ok((exact, commit.to_string()))
     }
 
@@ -447,14 +510,16 @@ mod linux {
             return;
         };
         let path = dir.join(UNIT_NAME);
-        if path.exists() {
+        if path.exists() && volume::systemctl_user(&["is-enabled", "--quiet", UNIT_NAME]).is_ok() {
             return;
         }
         let res = (|| -> Result<()> {
             let exe = std::env::current_exe()?;
             let cfg = config::config_path().context("no config path")?;
             fs::create_dir_all(&dir)?;
-            fs::write(&path, systemd_unit(&exe, &cfg))?;
+            if !path.exists() {
+                fs::write(&path, systemd_unit(&exe, &cfg))?;
+            }
             volume::systemctl_user(&["daemon-reload"])?;
             volume::systemctl_user(&["enable", UNIT_NAME])?;
             Ok(())
@@ -487,6 +552,9 @@ mod linux {
 
     /// `sharetree add --overlay ...`
     pub fn add(a: &AddArgs) -> Result<(i32, PathBuf)> {
+        if let Some(var) = git::context_override() {
+            bail!("--overlay requires Git to discover each worktree from its path; unset {var}");
+        }
         let cwd = std::env::current_dir()?;
         let dest = util::absolutize(Path::new(a.path.as_ref().expect("checked")), &cwd);
         prerequisites()?;
@@ -499,13 +567,30 @@ mod linux {
         if git::config_bool(&cwd, "core.splitIndex")? == Some(true) {
             bail!("--overlay does not support core.splitIndex");
         }
-        if dest.symlink_metadata().is_ok()
-            && (!dest.is_dir() || fs::read_dir(&dest)?.next().is_some())
-        {
-            bail!("'{}' already exists", dest.display());
-        }
+        let guard = lifecycle_lock()?;
         let common = git::common_dir(&cwd)?;
-        let main = git::list_worktrees(&cwd)?
+        if let Some(entry) = find_entry(&Config::load()?, &common, &dest) {
+            match entry.phase {
+                OverlayPhase::Creating => finish_removal(&cwd, entry)?,
+                OverlayPhase::Ready | OverlayPhase::Removing => {
+                    bail!(
+                        "{} is already an overlay worktree; remove it with `sharetree rm`",
+                        dest.display()
+                    );
+                }
+            }
+        }
+        match dest.symlink_metadata() {
+            Ok(m) if m.is_dir() && fs::read_dir(&dest)?.next().is_none() => {}
+            Ok(_) => bail!("'{}' already exists", dest.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dest.display())),
+        }
+        let worktrees = git::list_worktrees(&cwd)?;
+        if worktrees.iter().any(|w| same_path(&w.path, &dest)) {
+            bail!("{} is already registered as a Git worktree", dest.display());
+        }
+        let main = worktrees
             .into_iter()
             .find(|w| w.is_main)
             .map(|w| w.path)
@@ -524,54 +609,57 @@ mod linux {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "worktree".into());
-        fs::create_dir_all(layout.worktrees())?;
         let wdir = volume::unique_child(&layout.worktrees(), &name);
-        let (upper, work) = (wdir.join("upper"), wdir.join("work"));
-        fs::create_dir_all(&upper)?;
-        fs::create_dir_all(&work)?;
+        let entry = OverlayEntry {
+            path: dest.clone(),
+            common_dir: common,
+            lower: base.clone(),
+            upper: wdir.join("upper"),
+            work: wdir.join("work"),
+            phase: OverlayPhase::Creating,
+        };
+        Config::update(|cfg| {
+            cfg.overlays.push(entry.clone());
+            Ok(())
+        })?;
 
-        // Register (locked), without a checkout.
-        let mut args: Vec<OsString> = vec!["worktree".into(), "add".into(), "--no-checkout".into()];
-        args.extend(a.forward.iter().cloned());
-        if !a.forward.iter().any(|f| f == "--lock") {
-            args.extend([
-                "--lock".into(),
-                "--reason".into(),
-                lock_reason(&name).into(),
-            ]);
+        enum Checkout {
+            Ready(String),
+            GitRejected(i32),
         }
-        if a.separator {
-            args.push("--".into());
-        }
-        args.push(dest.clone().into_os_string());
-        if let Some(c) = &a.commitish {
-            args.push(c.clone());
-        }
-        let st = git::run_inherit(&cwd, &args)?;
-        if !st.success() {
-            let _ = remove_tree(&wdir);
-            return Ok((st.code().unwrap_or(1), dest));
-        }
-        let res = (|| -> Result<i32> {
+
+        let result = (|| -> Result<Checkout> {
+            fs::create_dir_all(&entry.upper)?;
+            fs::create_dir_all(&entry.work)?;
+
+            let mut args: Vec<OsString> =
+                vec!["worktree".into(), "add".into(), "--no-checkout".into()];
+            args.extend(a.forward.iter().cloned());
+            if !a.forward.iter().any(|f| f == "--lock") {
+                args.extend([
+                    "--lock".into(),
+                    "--reason".into(),
+                    lock_reason(&name).into(),
+                ]);
+            }
+            if a.separator {
+                args.push("--".into());
+            }
+            args.push(dest.clone().into_os_string());
+            if let Some(c) = &a.commitish {
+                args.push(c.clone());
+            }
+            let st = git::run_inherit(&cwd, &args)?;
+            if !st.success() {
+                return Ok(Checkout::GitRejected(st.code().unwrap_or(1)));
+            }
+
             let target = git::rev_parse_commit(&dest, OsStr::new("HEAD"))?;
             let admin = crate::rm::admin_dir(&dest)?;
-            fs::rename(dest.join(".git"), upper.join(".git"))
+            fs::rename(dest.join(".git"), entry.upper.join(".git"))
                 .context("moving .git into the upper dir")?;
-            let entry = OverlayEntry {
-                path: dest.clone(),
-                common_dir: common.clone(),
-                lower: base.clone(),
-                upper: upper.clone(),
-                work: work.clone(),
-            };
-            let mut cfg = Config::load()?;
-            cfg.overlays
-                .retain(|o| util::canon(&o.path) != util::canon(&dest));
-            cfg.overlays.push(entry.clone());
-            cfg.save()?;
             mount(&entry)?;
 
-            // Seed the index from the base's settled one.
             let base_index = crate::rm::admin_dir(&base)?.join("index");
             fs::copy(&base_index, admin.join("index")).context("seeding the index")?;
             let out = git::cmd(&dest)
@@ -592,160 +680,244 @@ mod linux {
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
-            let zero = "0".repeat(target.len());
-            let h = git::run_inherit(
-                &dest,
-                &[
-                    "hook",
-                    "run",
-                    "--ignore-missing",
-                    "post-checkout",
-                    "--",
-                    &zero,
-                    &target,
-                    "1",
-                ],
-            )?;
-            if !a.quiet {
-                eprintln!(
-                    "sharetree: overlay worktree at {} (lower: base {} at {}; upper: {} written so far)",
-                    dest.display(),
-                    &base_sha[..12.min(base_sha.len())],
-                    base.display(),
-                    human(dir_bytes(&upper).saturating_sub(dir_bytes(&upper.join(".git"))))
-                );
-                eprintln!("{COSTS}");
+            set_phase(&entry, OverlayPhase::Ready)?;
+            Ok(Checkout::Ready(target))
+        })();
+
+        let target = match result {
+            Ok(Checkout::Ready(target)) => target,
+            Ok(Checkout::GitRejected(code)) => {
+                finish_removal(&cwd, &entry).context("cleaning up rejected overlay creation")?;
+                return Ok((code, dest));
             }
-            install_unit_once(a.quiet);
-            Ok(if h.success() {
+            Err(err) => {
+                if let Err(cleanup) = finish_removal(&cwd, &entry) {
+                    return Err(err).context(format!(
+                        "overlay creation failed and cleanup is pending for {}: {cleanup:#}; retry with `sharetree rm`",
+                        dest.display()
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        install_unit_once(a.quiet);
+        drop(guard);
+
+        let zero = "0".repeat(target.len());
+        let h = git::run_inherit(
+            &dest,
+            &[
+                "hook",
+                "run",
+                "--ignore-missing",
+                "post-checkout",
+                "--",
+                &zero,
+                &target,
+                "1",
+            ],
+        )?;
+        if !a.quiet {
+            eprintln!(
+                "sharetree: overlay worktree at {} (lower: base {} at {}; upper: {} written so far)",
+                dest.display(),
+                &base_sha[..12.min(base_sha.len())],
+                base.display(),
+                human(dir_bytes(&entry.upper).saturating_sub(dir_bytes(&entry.upper.join(".git"))))
+            );
+            eprintln!("{COSTS}");
+        }
+        Ok((
+            if h.success() {
                 0
             } else {
                 h.code().unwrap_or(1)
-            })
-        })();
-        match res {
-            Ok(code) => Ok((code, dest)),
-            Err(e) => {
-                // Undo: unmount, drop registration and dirs, keep the base.
-                let _ = unmount(&dest);
-                let _ = git::output(
-                    &cwd,
-                    &[
-                        OsStr::new("worktree"),
-                        OsStr::new("remove"),
-                        OsStr::new("-f"),
-                        OsStr::new("-f"),
-                        dest.as_os_str(),
-                    ],
-                );
-                if let Ok(admin) = fs::read_to_string(upper.join(".git")) {
-                    if let Some(p) = admin.trim_end().strip_prefix("gitdir: ") {
-                        let _ = fs::remove_dir_all(p);
-                    }
-                }
-                let _ = remove_tree(&wdir);
-                let _ = fs::remove_dir(&dest);
-                if let Ok(mut cfg) = Config::load() {
-                    cfg.overlays
-                        .retain(|o| util::canon(&o.path) != util::canon(&dest));
-                    let _ = cfg.save();
-                }
-                Err(e)
-            }
-        }
+            },
+            dest,
+        ))
     }
 
-    /// `sharetree rm` of an overlay worktree: the same safety checks, then
-    /// unmount, drop the registration, delete upper/work, and remove the
-    /// base once no overlay uses it.
-    pub fn remove(cwd: &Path, wt_path: &Path, force: u8) -> Result<i32> {
-        let mut cfg = Config::load()?;
-        let Some(e) = cfg
+    fn same_path(a: &Path, b: &Path) -> bool {
+        a == b || util::canon(a) == util::canon(b)
+    }
+
+    fn find_entry<'a>(cfg: &'a Config, common: &Path, path: &Path) -> Option<&'a OverlayEntry> {
+        cfg.overlays
+            .iter()
+            .find(|o| same_path(&o.common_dir, common) && same_path(&o.path, path))
+    }
+
+    fn set_phase(e: &OverlayEntry, phase: OverlayPhase) -> Result<()> {
+        Config::update(|cfg| {
+            let stored = cfg
+                .overlays
+                .iter_mut()
+                .find(|o| o == &e)
+                .with_context(|| format!("overlay entry for {} changed", e.path.display()))?;
+            stored.phase = phase;
+            Ok(())
+        })
+    }
+
+    fn remove_base(cwd: &Path, path: &Path) -> Result<()> {
+        git::output(
+            cwd,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                OsStr::new("--force"),
+                path.as_os_str(),
+            ],
+        )
+        .with_context(|| format!("removing the unused overlay base {}", path.display()))?;
+        Ok(())
+    }
+
+    fn finish_removal(cwd: &Path, entry: &OverlayEntry) -> Result<()> {
+        unmount(&entry.path)?;
+        if let Some(admin) = crate::rm::registered_admin(&entry.common_dir, &entry.path)? {
+            let has_checkout_at_mountpoint =
+                crate::rm::admin_dir(&entry.path).is_ok_and(|a| same_path(&a, &admin));
+            // A Git worktree registered at the old mountpoint after our
+            // unregistration still has its .git file on the host directory.
+            if entry.phase == OverlayPhase::Creating && has_checkout_at_mountpoint {
+                fs::remove_file(entry.path.join(".git"))?;
+            }
+            if entry.phase == OverlayPhase::Creating || !has_checkout_at_mountpoint {
+                crate::rm::unregister(&entry.common_dir, &admin)?;
+            }
+        }
+        remove_tree(&entry.upper)?;
+        remove_tree(&entry.work)?;
+        if let Some(parent) = entry
+            .upper
+            .parent()
+            .filter(|p| entry.work.parent() == Some(p))
+        {
+            remove_mount_dir(parent)?;
+        }
+        remove_mount_dir(&entry.path)?;
+
+        let cfg = Config::load()?;
+        if !cfg
             .overlays
             .iter()
-            .find(|o| util::canon(&o.path) == util::canon(wt_path))
-            .cloned()
-        else {
-            bail!(
-                "{} is locked as an overlay worktree but is not in the sharetree config; \
-                 `git worktree unlock` it and remove it with git",
-                wt_path.display()
-            );
-        };
-        if !is_mounted(&e.path) {
-            if let Err(err) = mount(&e) {
-                if force < 2 {
-                    bail!("cannot mount {} to check it ({err:#}); `sharetree rm -f -f` removes it unchecked", e.path.display());
-                }
-            }
+            .any(|o| !same_path(&o.path, &entry.path) && same_path(&o.lower, &entry.lower))
+            && git::list_worktrees(cwd)?
+                .iter()
+                .any(|w| same_path(&w.path, &entry.lower) && is_base_lock(w.lock_reason.as_deref()))
+        {
+            remove_base(cwd, &entry.lower)?;
         }
-        if force == 0 && is_mounted(&e.path) {
-            let st = git::output(
-                &e.path,
-                &[
-                    "status",
-                    "--porcelain",
-                    "-z",
-                    "--untracked-files=normal",
-                    "--ignore-submodules=none",
-                ],
-            )?;
-            if !st.is_empty() {
-                bail!(
-                    "{} contains modified or untracked files, use --force to delete it",
-                    e.path.display()
-                );
-            }
-        }
-        let admin = fs::read_to_string(e.upper.join(".git"))
-            .ok()
-            .and_then(|t| t.trim_end().strip_prefix("gitdir: ").map(PathBuf::from));
-        unmount(&e.path)?;
-        match admin {
-            Some(a) if a.starts_with(cfg_common(&e)) => {
-                fs::remove_dir_all(&a).with_context(|| format!("removing {}", a.display()))?
-            }
-            _ => {
-                let _ = git::output(cwd, &["worktree", "prune"]);
-            }
-        }
-        if let Some(wdir) = e.upper.parent() {
-            remove_tree(wdir)?;
-        }
-        let _ = fs::remove_dir(&e.path);
-        cfg.overlays
-            .retain(|o| util::canon(&o.path) != util::canon(&e.path));
-        cfg.save()?;
-        eprintln!("sharetree: removed overlay worktree {}", e.path.display());
-        if !cfg.overlays.iter().any(|o| o.lower == e.lower) && e.lower.join(".git").is_file() {
-            let ok = git::succeeds(
-                cwd,
-                &[
-                    OsStr::new("worktree"),
-                    OsStr::new("remove"),
-                    OsStr::new("-f"),
-                    OsStr::new("-f"),
-                    e.lower.as_os_str(),
-                ],
-            );
-            if ok {
-                eprintln!(
-                    "sharetree: removed the unused overlay base {}",
-                    e.lower.display()
-                );
-            } else {
-                eprintln!(
-                    "sharetree: warning: could not remove the overlay base {}",
-                    e.lower.display()
-                );
-            }
-        }
+        let cfg = Config::update(|cfg| {
+            cfg.overlays.retain(|o| o != entry);
+            Ok(cfg.clone())
+        })?;
         remove_unit_if_unused(&cfg);
-        Ok(0)
+        Ok(())
     }
 
-    fn cfg_common(e: &OverlayEntry) -> PathBuf {
-        e.common_dir.join("worktrees")
+    fn remove_mount_dir(path: &Path) -> Result<()> {
+        match fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    /// A base may still be shared by active or interrupted overlays.
+    pub fn lock_unused_base(path: &Path) -> Result<fs::File> {
+        let lock = lifecycle_lock()?;
+        if Config::load()?
+            .overlays
+            .iter()
+            .any(|o| same_path(&o.lower, path))
+        {
+            bail!(
+                "{} is still used by an overlay worktree; remove its overlays first",
+                path.display()
+            );
+        }
+        Ok(lock)
+    }
+
+    /// Remove configured overlays, including interrupted removals whose Git
+    /// registration has already gone away.
+    pub fn remove(
+        cwd: &Path,
+        common: &Path,
+        path: &Path,
+        marked: bool,
+        force: u8,
+    ) -> Result<Option<i32>> {
+        if !marked && find_entry(&Config::load()?, common, path).is_none() {
+            return Ok(None);
+        }
+        let _lock = lifecycle_lock()?;
+        let cfg = Config::load()?;
+        let Some(entry) = find_entry(&cfg, common, path) else {
+            if marked {
+                bail!(
+                    "{} is locked as an overlay worktree but is not in the sharetree config; `git worktree unlock` it and remove it with git",
+                    path.display()
+                );
+            }
+            return Ok(None);
+        };
+        if util::is_within(cwd, &entry.path) {
+            bail!(
+                "refusing to remove {}: the current directory is inside it",
+                entry.path.display()
+            );
+        }
+        let mut entry = entry.clone();
+        if entry.phase == OverlayPhase::Ready {
+            let mounted = match mount_state(&entry.path)? {
+                MountState::Mounted => true,
+                MountState::Unmounted => false,
+                MountState::Occupied => {
+                    bail!("another filesystem is mounted on {}", entry.path.display());
+                }
+            };
+            if !mounted && force < 2 {
+                mount(&entry).with_context(|| {
+                    format!(
+                        "cannot mount {} to check it; `sharetree rm -f -f` removes it unchecked",
+                        entry.path.display()
+                    )
+                })?;
+            }
+            if force == 0 {
+                let checked = crate::rm::admin_dir(&entry.path)
+                    .and_then(|admin| crate::rm::check_clean(&entry.path, &admin));
+                if let Err(err) = checked {
+                    if !mounted {
+                        unmount(&entry.path).context(
+                            "restoring the unmounted overlay after the safety check failed",
+                        )?;
+                    }
+                    return Err(err);
+                }
+            }
+            set_phase(&entry, OverlayPhase::Removing)?;
+            entry.phase = OverlayPhase::Removing;
+        }
+        finish_removal(cwd, &entry)?;
+        eprintln!(
+            "sharetree: removed overlay worktree {}",
+            entry.path.display()
+        );
+        Ok(Some(0))
     }
 
     /// `sharetree mount [--all] [--unmount] [<path>...]`
@@ -764,18 +936,34 @@ mod linux {
         if !all && paths.is_empty() {
             bail!("usage: sharetree mount [--unmount] (--all | <worktree>...)");
         }
+        let _lock = lifecycle_lock()?;
         let cfg = Config::load()?;
         let chosen: Vec<&OverlayEntry> = cfg
             .overlays
             .iter()
-            .filter(|o| all || paths.iter().any(|p| util::canon(p) == util::canon(&o.path)))
+            .filter(|o| all || paths.iter().any(|p| same_path(p, &o.path)))
             .collect();
-        if !all && chosen.len() != paths.len() {
+        if !all
+            && !paths
+                .iter()
+                .all(|p| chosen.iter().any(|o| same_path(p, &o.path)))
+        {
             bail!("not every path given is an overlay worktree (see `sharetree ls`)");
         }
         let mut failed = 0;
         for o in chosen {
-            let r = if un { unmount(&o.path) } else { mount(o) };
+            let r = if un {
+                unmount(&o.path)
+            } else if o.phase == OverlayPhase::Ready {
+                mount(o)
+            } else if all {
+                continue;
+            } else {
+                Err(anyhow!(
+                    "{} has an unfinished overlay operation; run `sharetree rm` to clean it up",
+                    o.path.display()
+                ))
+            };
             match r {
                 Ok(()) => println!(
                     "{} {}",
@@ -823,6 +1011,18 @@ mod tests {
             Some((1, 9))
         );
         assert_eq!(parse_version("garbage"), None);
+        assert!(validate_fuse_version(
+            true,
+            "fusermount3 version: 3.18.3\nfuse-overlayfs: version 1.18"
+        )
+        .is_ok());
+        assert!(validate_fuse_version(
+            true,
+            "fusermount3 version: 3.18.3\nfuse-overlayfs: version 1.17"
+        )
+        .is_err());
+        assert!(validate_fuse_version(false, "fuse-overlayfs: version 1.18").is_err());
+        assert!(validate_fuse_version(true, "unrecognized output").is_err());
         assert!((1, 9) < MIN_VERSION && (1, 18) >= MIN_VERSION);
         assert!(is_overlay_lock(Some(&lock_reason("x"))));
         assert!(!is_overlay_lock(Some(BASE_LOCK_REASON)));

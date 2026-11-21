@@ -278,6 +278,7 @@ fn scenario(kind: &str) {
     assert!(sb.p("plain").is_dir() && !sb.p("plain").is_symlink());
 
     // Into the volume: a seed, then a reflinked worktree behind a symlink.
+    let before_placement = std::fs::read(&cfg).unwrap();
     let cow = sb.p("cow");
     let (_, err) = ok(
         &sb,
@@ -309,6 +310,25 @@ fn scenario(kind: &str) {
         let b = btrfs_exclusive(&content_paths(&real)).expect("btrfs filesystem du");
         assert_eq!(b, excl, "sharetree du uses btrfs filesystem du");
     }
+
+    let inside = real.with_file_name("inside");
+    let (_, err) = ok(
+        &sb,
+        &main,
+        &cfg,
+        &["add", "--detach", &inside.to_string_lossy()],
+    );
+    assert!(reflinked(&err) > 0, "{err}");
+    assert!(!err.contains("creating the volume's seed"), "{err}");
+    assert!(inside.is_dir() && !inside.is_symlink(), "{err}");
+    assert_equivalent(&sb, &sb.p("stock"), &inside);
+    assert_eq!(std::fs::read(&cfg).unwrap(), before_placement);
+    ok(
+        &sb,
+        &main,
+        &cfg,
+        &["rm", "--sync", &inside.to_string_lossy()],
+    );
 
     // auto_volume for this repo; --no-volume overrides it.
     ok(&sb, &main, &cfg, &["setup", "auto", "on", "--repo"]);

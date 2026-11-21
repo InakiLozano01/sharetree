@@ -1,4 +1,4 @@
-//! Space accounting (design §3, §8.5 `du`).
+//! Worktree listings and space accounting (`sharetree ls` and `du`).
 //!
 //! `du` sums each file's allocated blocks and cannot see that extents are
 //! shared, so N reflinked worktrees look like N full copies. What matters is
@@ -16,16 +16,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::git;
+use crate::git::{self, Worktree};
 use crate::util::human;
 
-#[derive(Clone, Debug)]
-pub struct Usage {
+struct Usage {
     /// What `du` would say: allocated blocks, shared or not.
-    pub apparent: u64,
+    apparent: u64,
     /// Bytes only this worktree holds, if measurable.
-    pub exclusive: Option<u64>,
-    pub method: &'static str,
+    exclusive: Option<Exclusive>,
+}
+
+struct Exclusive {
+    bytes: u64,
+    method: &'static str,
 }
 
 /// Top-level entries of a worktree, minus its `.git`.
@@ -89,8 +92,8 @@ fn btrfs_exclusive(entries: &[PathBuf]) -> Option<u64> {
 }
 
 /// Sum the Exclusive column of `btrfs filesystem du -s --raw`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn parse_btrfs_du(text: &str) -> Option<u64> {
+#[cfg(any(target_os = "linux", test))]
+fn parse_btrfs_du(text: &str) -> Option<u64> {
     let mut sum = 0u64;
     let mut rows = 0;
     for line in text.lines().skip(1) {
@@ -122,40 +125,117 @@ fn fiemap_unshared(p: &Path) -> Option<u64> {
     }
 }
 
-pub fn measure(root: &Path) -> Result<Usage> {
+fn measure(root: &Path) -> Result<Usage> {
     let entries = top_entries(root)?;
     let apparent = entries.iter().map(|e| allocated(e)).sum();
     #[cfg(target_os = "linux")]
-    {
-        if crate::linux::fs_magic(root) == Some(crate::linux::BTRFS_SUPER_MAGIC) {
-            if let Some(x) = btrfs_exclusive(&entries) {
-                return Ok(Usage {
-                    apparent,
-                    exclusive: Some(x),
-                    method: "btrfs filesystem du",
-                });
-            }
-        }
-        let mut sum = Some(0u64);
-        for e in &entries {
-            sum = sum.and_then(|s| fiemap_unshared(e).map(|x| s + x));
-        }
-        if let Some(x) = sum {
-            return Ok(Usage {
-                apparent,
-                exclusive: Some(x),
-                method: "FIEMAP unshared extents (estimate)",
-            });
-        }
-    }
+    let exclusive = exclusive(root, &entries);
+    #[cfg(not(target_os = "linux"))]
+    let exclusive = None;
     Ok(Usage {
         apparent,
-        exclusive: None,
-        method: "not measurable here (use a df delta)",
+        exclusive,
     })
 }
 
-pub const WHY_DU_LIES: &str = "\
+#[cfg(target_os = "linux")]
+fn exclusive(root: &Path, entries: &[PathBuf]) -> Option<Exclusive> {
+    if crate::linux::fs_magic(root) == Some(crate::linux::BTRFS_SUPER_MAGIC) {
+        if let Some(bytes) = btrfs_exclusive(entries) {
+            return Some(Exclusive {
+                bytes,
+                method: "btrfs fi du",
+            });
+        }
+    }
+    let bytes = entries
+        .iter()
+        .map(|entry| fiemap_unshared(entry))
+        .sum::<Option<u64>>()?;
+    Some(Exclusive {
+        bytes,
+        method: "fiemap estimate",
+    })
+}
+
+fn has_checkout(worktree: &Worktree) -> bool {
+    !worktree.bare && worktree.path.exists()
+}
+
+fn sync_before_measuring() {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("sync").status();
+}
+
+pub(crate) fn run_ls(args: &[OsString]) -> Result<i32> {
+    let mut sizes = true;
+    for a in args {
+        match a.to_str() {
+            Some("--no-size") => sizes = false,
+            _ => bail!("ls: unexpected argument {}", a.to_string_lossy()),
+        }
+    }
+    let cwd = std::env::current_dir()?;
+    let worktrees = git::list_worktrees(&cwd)?;
+    if sizes {
+        sync_before_measuring();
+        println!(
+            "{:>12} {:>12}  {:<24} PATH",
+            "EXCLUSIVE", "APPARENT", "HEAD"
+        );
+    } else {
+        println!("{:<24} PATH", "HEAD");
+    }
+    let mut measured_any = false;
+    for w in &worktrees {
+        let head = if w.bare {
+            "(bare)".to_string()
+        } else if let Some(b) = &w.branch {
+            b.trim_start_matches("refs/heads/").to_string()
+        } else if let Some(h) = &w.head {
+            format!("(detached {})", &h[..h.len().min(10)])
+        } else {
+            "(no HEAD)".to_string()
+        };
+        let mut flags = String::new();
+        if w.is_main {
+            flags.push_str(" [main]");
+        }
+        if w.locked {
+            flags.push_str(" [locked]");
+        }
+        if w.prunable {
+            flags.push_str(" [prunable]");
+        }
+        if !sizes {
+            println!("{head:<24} {}{flags}", w.path.display());
+            continue;
+        }
+        let (excl, app) = if has_checkout(w) {
+            let usage = measure(&w.path)?;
+            measured_any |= usage.exclusive.is_some();
+            (
+                usage.exclusive.map_or("?".into(), |x| human(x.bytes)),
+                human(usage.apparent),
+            )
+        } else {
+            ("-".to_string(), "-".to_string())
+        };
+        println!(
+            "{excl:>12} {app:>12}  {head:<24} {}{flags}",
+            w.path.display()
+        );
+    }
+    if sizes {
+        println!(
+            "\nEXCLUSIVE: bytes only that worktree holds ({}); APPARENT: what `du` reports.\nThe main worktree's .git is not counted. See `sharetree du` for details.",
+            if measured_any { "btrfs fi du or FIEMAP" } else { "not measurable on this filesystem" }
+        );
+    }
+    Ok(0)
+}
+
+const WHY_DU_LIES: &str = "\
 `du` (APPARENT) adds up every file's blocks and cannot see that reflinked
 extents are shared, so it reports each worktree as a full copy. EXCLUSIVE is
 what deleting the worktree would free. On Btrfs it comes from
@@ -163,7 +243,7 @@ what deleting the worktree would free. On Btrfs it comes from
 truth, compare `df` (statvfs free space) before and after, after `sync`, on an
 otherwise idle filesystem. Extents shared with snapshots count as shared.";
 
-pub fn run_du(args: &[OsString]) -> Result<i32> {
+pub(crate) fn run_du(args: &[OsString]) -> Result<i32> {
     let mut raw = false;
     let mut all = false;
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -179,14 +259,13 @@ pub fn run_du(args: &[OsString]) -> Result<i32> {
     if all {
         paths = git::list_worktrees(&cwd)?
             .into_iter()
-            .filter(|w| !w.bare && w.path.exists())
+            .filter(has_checkout)
             .map(|w| w.path)
             .collect();
     } else if paths.is_empty() {
         paths.push(git::toplevel(&cwd)?);
     }
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("sync").status();
+    sync_before_measuring();
     if !raw {
         println!(
             "{:>12} {:>12}  {:<22} PATH",
@@ -199,21 +278,17 @@ pub fn run_du(args: &[OsString]) -> Result<i32> {
             println!(
                 "{}\t{}\t{}",
                 u.apparent,
-                u.exclusive.map_or("-".to_string(), |x| x.to_string()),
+                u.exclusive.map_or("-".to_string(), |x| x.bytes.to_string()),
                 p.display()
             );
         } else {
-            let method = if u.method.starts_with("btrfs") {
-                "btrfs fi du"
-            } else if u.method.starts_with("FIEMAP") {
-                "fiemap estimate"
-            } else {
-                "n/a"
-            };
+            let (exclusive, method) = u
+                .exclusive
+                .map_or(("?".to_string(), "n/a"), |x| (human(x.bytes), x.method));
             println!(
                 "{:>12} {:>12}  {:<22} {}",
                 human(u.apparent),
-                u.exclusive.map_or("?".to_string(), human),
+                exclusive,
                 method,
                 p.display()
             );

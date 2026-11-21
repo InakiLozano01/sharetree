@@ -13,6 +13,8 @@
 //!    with a hint on how to choose.
 //! 3. Nothing configured: plain git, with a hint pointing to `sharetree setup`.
 
+use crate::config::Volume;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     Linux,
@@ -36,13 +38,12 @@ impl Platform {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Inputs {
+pub struct Inputs<'a> {
     /// The reflink probe beside the destination succeeded.
     pub probe_ok: bool,
     /// The destination already lies inside the configured volume.
     pub dest_in_volume: bool,
-    /// Name of the volume configured for this repository, if any.
-    pub volume: Option<String>,
+    pub volume: Option<&'a Volume>,
     /// `auto_volume` for this repository (config); None: not chosen yet.
     pub auto_volume: Option<bool>,
     /// `--into-volume`.
@@ -63,25 +64,21 @@ pub enum Hint {
     SetupDevDrive,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Decision {
-    /// Reflink at the requested destination. `seed`: the destination is in a
-    /// sharetree volume, so make sure the volume's seed checkout exists and
-    /// use it as the donor.
-    Reflink { seed: bool },
-    /// Relocate the worktree into the volume (mounting it if needed).
-    IntoVolume(String),
-    /// The destination cannot reflink and the user has not decided whether
-    /// to use this volume: ask (terminal) or fall back to plain with
-    /// `Hint::VolumeUndecided` (no terminal). See `resolve_ask`.
-    Ask(String),
+#[derive(Debug, PartialEq)]
+pub enum Decision<'a> {
+    /// Reflink at the requested destination.
+    Reflink,
+    /// Use the configured volume at the requested path or relocate into it.
+    Volume(&'a Volume),
+    /// Ask before using the volume. Without a terminal, use plain Git with a hint.
+    Ask(&'a Volume),
     /// Plain `git worktree add` at the requested destination.
     Plain(Hint),
     /// Refuse: the user asked for something that cannot be done.
     Fail(String),
 }
 
-pub fn decide(i: &Inputs, platform: Platform) -> Decision {
+pub fn decide<'a>(i: &Inputs<'a>, platform: Platform) -> Decision<'a> {
     if i.into_volume && i.no_volume {
         return Decision::Fail("--into-volume and --no-volume contradict each other".into());
     }
@@ -92,13 +89,13 @@ pub fn decide(i: &Inputs, platform: Platform) -> Decision {
     };
     if i.no_volume {
         return if i.probe_ok {
-            Decision::Reflink { seed: false }
+            Decision::Reflink
         } else {
             Decision::Plain(Hint::None)
         };
     }
     if i.into_volume {
-        return match &i.volume {
+        return match i.volume {
             None => Decision::Fail(match platform {
                 Platform::Windows => {
                     "--into-volume: no Dev Drive is configured; run `sharetree setup devdrive` first"
@@ -110,21 +107,20 @@ pub fn decide(i: &Inputs, platform: Platform) -> Decision {
                 }
                 _ => "--into-volume: sharetree volumes exist only on Linux and Windows".into(),
             }),
-            Some(_) if i.dest_in_volume && i.probe_ok => Decision::Reflink { seed: true },
-            Some(v) => Decision::IntoVolume(v.clone()),
+            Some(v) => Decision::Volume(v),
         };
+    }
+    if let Some(v) = i.volume.filter(|_| i.dest_in_volume) {
+        return Decision::Volume(v);
     }
     if i.probe_ok {
-        return Decision::Reflink {
-            seed: i.dest_in_volume && i.volume.is_some(),
-        };
+        return Decision::Reflink;
     }
-    match (&i.volume, i.auto_volume) {
-        (Some(v), _) if i.dest_in_volume => Decision::IntoVolume(v.clone()),
-        (Some(v), Some(true)) => Decision::IntoVolume(v.clone()),
+    match (i.volume, i.auto_volume) {
+        (Some(v), Some(true)) => Decision::Volume(v),
         // The user said "never": no nagging.
         (Some(_), Some(false)) => Decision::Plain(Hint::None),
-        (Some(v), None) => Decision::Ask(v.clone()),
+        (Some(v), None) => Decision::Ask(v),
         (None, _) => Decision::Plain(setup_hint),
     }
 }
@@ -171,16 +167,6 @@ pub fn parse_answer(s: &str) -> Option<Answer> {
     }
 }
 
-/// Turn `Decision::Ask` into a final decision. `answer` is the user's
-/// reply when a terminal was available to ask on, None otherwise.
-pub fn resolve_ask(volume: &str, answer: Option<Answer>) -> Decision {
-    match answer {
-        Some(a) if a.use_volume() => Decision::IntoVolume(volume.to_string()),
-        Some(_) => Decision::Plain(Hint::None),
-        None => Decision::Plain(Hint::VolumeUndecided(volume.to_string())),
-    }
-}
-
 /// One-paragraph hint printed after a plain fallback.
 pub fn hint_text(h: &Hint, fs: &str) -> Option<String> {
     match h {
@@ -208,63 +194,72 @@ pub fn hint_text(h: &Hint, fs: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn inp() -> Inputs {
+    use crate::config::{MountMethod, VolumeKind};
+
+    fn volume(name: &str) -> Volume {
+        Volume {
+            name: name.into(),
+            kind: VolumeKind::Btrfs,
+            image: "test.img".into(),
+            label: "sharetree".into(),
+            size: 1 << 30,
+            mount: MountMethod::Udisks,
+            mountpoint: None,
+            unit: None,
+        }
+    }
+
+    fn inp() -> Inputs<'static> {
         Inputs::default()
     }
 
     #[test]
     fn reflink_probe_wins_when_nothing_else_asked() {
+        let v = volume("default");
         let i = Inputs {
             probe_ok: true,
-            volume: Some("default".into()),
+            volume: Some(&v),
             auto_volume: Some(true),
             ..inp()
         };
         assert_eq!(
             decide(&i, Platform::Linux),
-            Decision::Reflink { seed: false },
+            Decision::Reflink,
             "a reflink-capable destination never moves into the volume automatically"
         );
     }
 
     #[test]
-    fn destination_inside_the_volume_seeds() {
+    fn destination_inside_the_volume_uses_volume_placement() {
+        let v = volume("default");
         let i = Inputs {
             probe_ok: true,
             dest_in_volume: true,
-            volume: Some("default".into()),
+            volume: Some(&v),
             ..inp()
         };
-        assert_eq!(
-            decide(&i, Platform::Linux),
-            Decision::Reflink { seed: true }
-        );
+        assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
         let i = Inputs {
             into_volume: true,
             ..i
         };
-        assert_eq!(
-            decide(&i, Platform::Linux),
-            Decision::Reflink { seed: true }
-        );
+        assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
     }
 
     #[test]
     fn no_reflink_with_volume_asks_unless_chosen() {
+        let v = volume("v");
         let mut i = Inputs {
-            volume: Some("v".into()),
+            volume: Some(&v),
             ..inp()
         };
         assert_eq!(
             decide(&i, Platform::Linux),
-            Decision::Ask("v".into()),
+            Decision::Ask(&v),
             "undecided: ask"
         );
         i.auto_volume = Some(true);
-        assert_eq!(
-            decide(&i, Platform::Linux),
-            Decision::IntoVolume("v".into())
-        );
+        assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
         i.auto_volume = Some(false);
         assert_eq!(
             decide(&i, Platform::Linux),
@@ -273,16 +268,10 @@ mod tests {
         );
         i.auto_volume = None;
         i.into_volume = true;
-        assert_eq!(
-            decide(&i, Platform::Linux),
-            Decision::IntoVolume("v".into())
-        );
+        assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
         // An explicit --into-volume wins even where reflinks work.
         i.probe_ok = true;
-        assert_eq!(
-            decide(&i, Platform::Linux),
-            Decision::IntoVolume("v".into())
-        );
+        assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
     }
 
     #[test]
@@ -316,8 +305,9 @@ mod tests {
 
     #[test]
     fn no_volume_flag_overrides_auto() {
+        let v = volume("v");
         let i = Inputs {
-            volume: Some("v".into()),
+            volume: Some(&v),
             no_volume: true,
             ..inp()
         };
@@ -331,22 +321,21 @@ mod tests {
 
     #[test]
     fn windows_dev_drive_destination_goes_through_placement() {
-        // Windows has no clone engine yet: probe_ok is always false there.
+        let v = volume("devdrive");
+        // A Dev Drive is still a placement destination with cloning disabled.
         let i = Inputs {
             dest_in_volume: true,
-            volume: Some("devdrive".into()),
+            volume: Some(&v),
             ..inp()
         };
-        assert_eq!(
-            decide(&i, Platform::Windows),
-            Decision::IntoVolume("devdrive".into())
-        );
+        assert_eq!(decide(&i, Platform::Windows), Decision::Volume(&v));
     }
 
     #[test]
     fn flags_and_reflink_never_ask() {
+        let v = volume("v");
         let base = Inputs {
-            volume: Some("v".into()),
+            volume: Some(&v),
             ..inp()
         };
         for i in [
@@ -380,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_parse_and_resolve() {
+    fn answers_parse_and_define_current_and_future_choices() {
         assert_eq!(parse_answer("y\n"), Some(Answer::Once));
         assert_eq!(parse_answer(" A "), Some(Answer::Always));
         assert_eq!(
@@ -397,27 +386,11 @@ mod tests {
         assert_eq!(Answer::Always.persist(), Some(true));
         assert_eq!(Answer::Never.persist(), Some(false));
 
-        assert_eq!(
-            resolve_ask("v", Some(Answer::Once)),
-            Decision::IntoVolume("v".into())
-        );
-        assert_eq!(
-            resolve_ask("v", Some(Answer::Always)),
-            Decision::IntoVolume("v".into())
-        );
-        assert_eq!(
-            resolve_ask("v", Some(Answer::NotNow)),
-            Decision::Plain(Hint::None)
-        );
-        assert_eq!(
-            resolve_ask("v", Some(Answer::Never)),
-            Decision::Plain(Hint::None)
-        );
-        assert_eq!(
-            resolve_ask("v", None),
-            Decision::Plain(Hint::VolumeUndecided("v".into())),
-            "no terminal: plain, with a hint"
-        );
+        assert!(Answer::Once.use_volume());
+        assert!(Answer::Always.use_volume());
+        assert!(!Answer::NotNow.use_volume());
+        assert!(!Answer::Never.use_volume());
+
         let h = hint_text(&Hint::VolumeUndecided("v".into()), "ext4").unwrap();
         assert!(
             h.contains("--into-volume") && h.contains("setup auto on --repo"),

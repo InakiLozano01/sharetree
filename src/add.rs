@@ -8,7 +8,7 @@
 //! 5. Clone in parallel; re-`fstat` the donor after each clone.
 //! 6. Hash every clone in-process (sha1dc / SHA-256); drop mismatches.
 //! 7. Write a v2 index of verified entries with their real lstat data.
-//! 8. `git checkout -f HEAD` writes the rest (retry plainly on rejection).
+//! 8. `git reset --hard --no-recurse-submodules` writes the rest.
 //! 9. Run post-checkout like `git worktree add` would.
 //!
 //! Flow and index trick from josharian/git-cow-worktree (MIT); donor scoring
@@ -16,11 +16,13 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::backend::{self, Decision, Hint};
 use crate::config::{Config, Volume};
+use crate::util::Trace;
 use crate::{git, util, volume};
 
 /// Files at or below btrfs's default `max_inline` (2048 bytes) live in
@@ -53,13 +55,8 @@ pub struct AddArgs {
     pub overlay: bool,
     /// `--windows-clone`: enable ReFS block cloning on Windows.
     pub windows_clone: bool,
-    /// Backend already chosen (relocated into a volume, or a seed): skip
-    /// selection.
-    pub placed: bool,
     /// sharetree's own seed checkout: no hooks, no summary, no advice.
     pub internal: bool,
-    /// Preferred donor (the volume's seed).
-    pub extra_donor: Option<PathBuf>,
 }
 
 impl AddArgs {
@@ -82,7 +79,6 @@ impl AddArgs {
         if let Some(c) = &a.commitish {
             a.git_args.push(c.clone());
         }
-        a.placed = true;
         a
     }
 }
@@ -137,17 +133,23 @@ pub fn parse(args: &[OsString]) -> Result<AddArgs> {
             Some(s) if s.starts_with("--min-size=") => {
                 a.min_size = parse_size(Some(&OsString::from(&s[11..])))?;
             }
-            Some("--no-checkout") => {
+            // Include Git's unambiguous abbreviations of the checkout
+            // switches. A checkout switch must never override our internal
+            // --no-checkout.
+            Some(s) if s.starts_with("--no-c") && "--no-checkout".starts_with(s) => {
                 a.no_checkout = true;
                 a.git_args.push(arg.clone());
             }
-            // Never forwarded internally: it would override --no-checkout.
-            Some("--checkout") => {
+            Some(s) if s.starts_with("--c") && "--checkout".starts_with(s) => {
                 a.no_checkout = false;
                 a.git_args.push(arg.clone());
             }
-            Some("--orphan") => {
+            Some(s) if s.starts_with("--o") && "--orphan".starts_with(s) => {
                 a.orphan = true;
+                a.git_args.push(arg.clone());
+            }
+            Some(s) if s.starts_with("--no-o") && "--no-orphan".starts_with(s) => {
+                a.orphan = false;
                 a.git_args.push(arg.clone());
             }
             Some("-q" | "--quiet") => {
@@ -155,7 +157,10 @@ pub fn parse(args: &[OsString]) -> Result<AddArgs> {
                 a.forward.push(arg.clone());
                 a.git_args.push(arg.clone());
             }
-            Some("-b" | "-B" | "--reason") => {
+            Some(s)
+                if matches!(s, "-b" | "-B")
+                    || (s.starts_with("--reas") && "--reason".starts_with(s)) =>
+            {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("{} requires a value", arg.to_string_lossy()))?;
@@ -203,97 +208,211 @@ pub fn run(args: &[OsString]) -> Result<i32> {
     } else {
         dispatch(&a)?
     };
-    if code == 0 && !a.quiet && !a.internal {
+    if code == 0 && !a.quiet {
         crate::advise::print_add_hint(&made);
     }
     Ok(code)
 }
 
-#[cfg(unix)]
+const NO_CLONE: &str =
+    "copy-on-write worktrees are not enabled on this platform (ReFS block cloning is off by default, see README)";
+
 fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
-    if a.windows_clone {
+    let cwd = std::env::current_dir()?;
+    let dest = cwd.join(a.path.as_ref().expect("checked by caller"));
+    let plain =
+        |why: &str| -> Result<(i32, PathBuf)> { Ok((delegate(a, &cwd, why)?, dest.clone())) };
+
+    let cfg = cfg!(windows).then(Config::load);
+    let clone_enabled = cfg!(unix)
+        || (cfg!(windows)
+            && (a.windows_clone || matches!(&cfg, Some(Ok(c)) if c.windows_clone == Some(true))));
+    if a.windows_clone && cfg!(unix) {
         eprintln!("sharetree: --windows-clone has no effect outside Windows");
     }
-    engine::run(a)
-}
-
-/// Windows: the clone engine runs only when block cloning was asked for
-/// (`--windows-clone` or `windows_clone = true`), with a loud note.
-#[cfg(windows)]
-fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
-    let enabled = a.windows_clone
-        || Config::load()
-            .ok()
-            .and_then(|c| c.windows_clone)
-            .unwrap_or(false);
-    if !enabled {
-        return run_without_engine(a);
-    }
-    if !a.quiet {
+    #[cfg(windows)]
+    if clone_enabled && !a.quiet {
         eprintln!("sharetree: note: {}", crate::winclone::NOTE);
     }
-    engine::run(a)
-}
 
-#[cfg(not(any(unix, windows)))]
-fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
-    run_without_engine(a)
-}
-
-/// What backend selection needs to know about the volume.
-pub(crate) struct Selection {
-    pub decision: Decision,
-    pub common: PathBuf,
-    pub volume: Option<Volume>,
-}
-
-/// Backend selection (research note §7.2); see `backend.rs` for the policy.
-pub(crate) fn select(a: &AddArgs, cwd: &Path, dest: &Path, probe_ok: bool) -> Result<Selection> {
-    let common = git::common_dir(cwd)?;
-    if a.placed || a.internal {
-        return Ok(Selection {
-            decision: if probe_ok {
-                Decision::Reflink { seed: false }
-            } else {
-                Decision::Plain(Hint::None)
-            },
-            common,
-            volume: None,
-        });
+    let opt_out = if a.no_cow {
+        Some("--no-cow given")
+    } else if a.no_checkout {
+        Some("--no-checkout: there is nothing to clone")
+    } else if a.orphan {
+        Some("--orphan: there is nothing to clone")
+    } else {
+        None
+    };
+    if let Some(why) = opt_out.filter(|_| clone_enabled) {
+        return plain(why);
     }
-    let cfg = Config::load().unwrap_or_else(|e| {
+    if let Some(var) = git::context_override() {
+        return plain(&format!("{var} is set"));
+    }
+    if opt_out.is_some() {
+        return plain(NO_CLONE);
+    }
+    if clone_enabled && std::env::var_os("SHARETREE_FORCE_FALLBACK").is_some() {
+        return plain("SHARETREE_FORCE_FALLBACK is set");
+    }
+    let Ok(common) = git::common_dir(&cwd) else {
+        return plain(if clone_enabled {
+            "not inside a git repository"
+        } else {
+            NO_CLONE
+        });
+    };
+    if clone_enabled {
+        if git::config_bool(&cwd, "core.splitIndex")? == Some(true) {
+            return plain("core.splitIndex is enabled");
+        }
+        for hook in ["reference-transaction", "post-index-change"] {
+            if git::hook_exists(&cwd, hook)? {
+                return plain(&format!("a {hook} hook is installed"));
+            }
+        }
+    }
+
+    let trace = Trace::new(a.verbose);
+    let probe = CloneProbe::at(&dest, clone_enabled, &trace);
+    let cfg = cfg.unwrap_or_else(Config::load).unwrap_or_else(|e| {
         eprintln!("sharetree: warning: ignoring the config: {e:#}");
         Config::default()
     });
-    let volume = cfg.volume_for(&common).cloned();
-    let dest_in_volume = volume
-        .as_ref()
-        .and_then(|v| volume::current_state(v).mountpoint().map(Path::to_path_buf))
-        .is_some_and(|mp| util::is_within(&util::nearest_existing(dest), &mp));
-    let mut decision = backend::decide(
+    let volume = cfg.volume_for(&common);
+    let dest_in_volume =
+        volume.is_some_and(|v| in_mount(&dest, volume::current_state(v).mountpoint()));
+    let decision = backend::decide(
         &backend::Inputs {
-            probe_ok,
+            probe_ok: probe.succeeded(),
             dest_in_volume,
-            volume: volume.as_ref().map(|v| v.name.clone()),
+            volume,
             auto_volume: cfg.auto_volume_for(&common),
             into_volume: a.into_volume,
             no_volume: a.no_volume,
         },
         backend::Platform::current(),
     );
-    if let Decision::Ask(v) = &decision {
-        let answer = if can_prompt() {
-            Some(ask_volume(v, dest, &common)?)
-        } else {
-            None
-        };
-        decision = backend::resolve_ask(v, answer);
+    trace.note(format!("backend: {decision:?}"));
+    let fallback = |hint| Ok((probe.fallback(a, &cwd, &hint)?, dest.clone()));
+    let v = match decision {
+        Decision::Fail(msg) => bail!(msg),
+        Decision::Reflink => {
+            let code = probe.create(a, &cwd, &dest, None, &trace)?;
+            return Ok((code, dest));
+        }
+        Decision::Plain(hint) => return fallback(hint),
+        Decision::Volume(v) => v,
+        Decision::Ask(v) => {
+            if !can_prompt() {
+                return fallback(Hint::VolumeUndecided(v.name.clone()));
+            }
+            if !ask_volume(&v.name, &dest, &common)?.use_volume() {
+                return fallback(Hint::None);
+            }
+            v
+        }
+    };
+
+    let placement = Placement::prepare(a, &cwd, &common, &dest, v)?;
+    let code = if clone_enabled {
+        #[cfg(any(unix, windows))]
+        {
+            let donor = engine::ensure_seed(&cwd, &placement.repo_root, a, &trace)?;
+            let relocated_probe =
+                (placement.real != dest).then(|| CloneProbe::at(&placement.real, true, &trace));
+            relocated_probe.as_ref().unwrap_or(&probe).create(
+                &placement.args,
+                &cwd,
+                &placement.real,
+                Some(&donor),
+                &trace,
+            )?
+        }
+        #[cfg(not(any(unix, windows)))]
+        unreachable!("the clone engine is unavailable")
+    } else {
+        delegate(
+            &placement.args,
+            &cwd,
+            "placing the worktree in the Dev Drive (sharetree does not block-clone on Windows yet)",
+        )?
+    };
+    if code == 0 {
+        let quiet = a.quiet || (dest_in_volume && probe.succeeded());
+        placement.finish(v, quiet)?;
     }
-    Ok(Selection {
-        decision,
-        common,
-        volume,
-    })
+    Ok((code, placement.real))
+}
+
+fn in_mount(dest: &Path, mountpoint: Option<&Path>) -> bool {
+    mountpoint.is_some_and(|mp| util::is_within(&util::nearest_existing(dest), mp))
+}
+
+enum CloneProbe {
+    Succeeded(PathBuf),
+    Failed { anchor: PathBuf, reason: String },
+    Disabled,
+}
+
+impl CloneProbe {
+    fn at(dest: &Path, enabled: bool, trace: &Trace) -> Self {
+        if !enabled {
+            return Self::Disabled;
+        }
+        // Probe beside the destination rather than among its existing files.
+        let anchor = util::nearest_existing(dest.parent().unwrap_or(dest));
+        let t = Instant::now();
+        #[cfg(any(unix, windows))]
+        let result = crate::reflink::probe(&anchor);
+        #[cfg(not(any(unix, windows)))]
+        let result = Err(NO_CLONE.to_owned());
+        trace.phase("probe", t);
+        match result {
+            Ok(()) => Self::Succeeded(anchor),
+            Err(reason) => Self::Failed { anchor, reason },
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        matches!(self, Self::Succeeded(_))
+    }
+
+    fn fallback(&self, a: &AddArgs, cwd: &Path, hint: &Hint) -> Result<i32> {
+        let (reason, fs) = match self {
+            Self::Failed { anchor, reason } => {
+                let fs = fs_label(anchor);
+                (
+                    format!("{} ({fs}) cannot reflink: {reason}", anchor.display()),
+                    fs,
+                )
+            }
+            _ => (NO_CLONE.to_owned(), "NTFS"),
+        };
+        let code = delegate(a, cwd, &reason)?;
+        if !a.quiet {
+            if let Some(t) = backend::hint_text(hint, fs) {
+                eprintln!("sharetree: {t}");
+            }
+        }
+        Ok(code)
+    }
+
+    fn create(
+        &self,
+        a: &AddArgs,
+        cwd: &Path,
+        dest: &Path,
+        donor: Option<&Path>,
+        trace: &Trace,
+    ) -> Result<i32> {
+        #[cfg(any(unix, windows))]
+        if let Self::Succeeded(anchor) = self {
+            return engine::create(a, cwd, dest, anchor, donor, trace);
+        }
+        self.fallback(a, cwd, &Hint::None)
+    }
 }
 
 /// Prompt only when a person is there to answer: stdin and stderr are
@@ -335,9 +454,11 @@ fn ask_volume(v: &str, dest: &Path, common: &Path) -> Result<backend::Answer> {
         }
     };
     if let Some(on) = answer.persist() {
-        let mut cfg = Config::load()?;
-        cfg.repo_mut(common).auto_volume = Some(on);
-        let p = cfg.save()?;
+        Config::update(|cfg| {
+            cfg.repo_mut(common).auto_volume = Some(on);
+            Ok(())
+        })?;
+        let p = crate::config::config_path().unwrap_or_default();
         eprintln!(
             "sharetree: saved auto_volume = {on} for this repository in {} \
              (change it with `sharetree setup auto on|off --repo`)",
@@ -347,157 +468,120 @@ fn ask_volume(v: &str, dest: &Path, common: &Path) -> Result<backend::Answer> {
     Ok(answer)
 }
 
-fn fs_label(p: &Path) -> String {
+fn fs_label(p: &Path) -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        crate::linux::fs_name(p).to_string()
+        crate::linux::fs_name(p)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = p;
-        "this filesystem".to_string()
+        "this filesystem"
     }
 }
 
-/// Where a worktree goes inside a volume: `<root>/<repo-id>/<name>`, or the
-/// requested path itself when it already lies inside the volume.
-pub(crate) struct Placement {
-    pub requested: PathBuf,
-    pub real: PathBuf,
-    pub repo_root: PathBuf,
-    pub args: AddArgs,
+struct Placement {
+    requested: PathBuf,
+    real: PathBuf,
+    repo_root: PathBuf,
+    args: AddArgs,
+    _volume_lock: std::fs::File,
 }
 
-pub(crate) fn place(a: &AddArgs, cwd: &Path, common: &Path, v: &Volume) -> Result<Placement> {
-    let requested = util::absolutize(Path::new(a.path.as_ref().expect("checked")), cwd);
-    let mp = volume::mount_any(v, a.quiet)?;
-    let main = git::list_worktrees(cwd)?
-        .into_iter()
-        .find(|w| w.is_main)
-        .map(|w| w.path)
-        .unwrap_or_else(|| common.to_path_buf());
-    let repo_root = volume::worktrees_root(v, &mp).join(volume::repo_id(common, &main));
-    std::fs::create_dir_all(&repo_root)
-        .with_context(|| format!("creating {}", repo_root.display()))?;
-    let real = if util::is_within(&util::nearest_existing(&requested), &mp) {
-        requested.clone()
-    } else {
-        if let Ok(md) = requested.symlink_metadata() {
-            let empty_dir =
-                md.is_dir() && std::fs::read_dir(&requested).is_ok_and(|mut r| r.next().is_none());
-            if !empty_dir {
-                bail!(
-                    "'{}' already exists (the worktree would live in the volume, with a symlink here)",
-                    requested.display()
-                );
+impl Placement {
+    fn prepare(
+        a: &AddArgs,
+        cwd: &Path,
+        common: &Path,
+        requested: &Path,
+        v: &Volume,
+    ) -> Result<Self> {
+        let volume_lock = crate::config::lock_volume_use()?;
+        let cfg = Config::load()?;
+        let current = cfg
+            .volume_for(common)
+            .filter(|current| current.name == v.name && current.image == v.image)
+            .with_context(|| format!("volume '{}' changed while preparing the worktree", v.name))?;
+        let mp = volume::mount_any(current, a.quiet)?;
+        let main = git::list_worktrees(cwd)?
+            .into_iter()
+            .find(|w| w.is_main)
+            .map(|w| w.path)
+            .unwrap_or_else(|| common.to_path_buf());
+        let repo_root = volume::worktrees_root(current, &mp).join(volume::repo_id(common, &main));
+        std::fs::create_dir_all(&repo_root)
+            .with_context(|| format!("creating {}", repo_root.display()))?;
+        let real = if in_mount(requested, Some(&mp)) {
+            requested.to_path_buf()
+        } else {
+            if let Ok(md) = requested.symlink_metadata() {
+                let empty_dir = md.is_dir()
+                    && std::fs::read_dir(requested).is_ok_and(|mut r| r.next().is_none());
+                if !empty_dir {
+                    bail!(
+                        "'{}' already exists (the worktree would live in the volume, with a symlink here)",
+                        requested.display()
+                    );
+                }
             }
-        }
-        let name = requested
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "worktree".into());
-        volume::unique_child(&repo_root, &name)
-    };
-    let reason = volume::volume_lock_reason(&v.name);
-    let args = a.relocated(&real, Some(&reason));
-    Ok(Placement {
-        requested,
-        real,
-        repo_root,
-        args,
-    })
-}
+            let name = requested
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "worktree".into());
+            volume::unique_child(&repo_root, &name)
+        };
+        let reason = volume::volume_lock_reason(&v.name);
+        let args = a.relocated(&real, Some(&reason));
+        Ok(Self {
+            requested: requested.to_path_buf(),
+            real,
+            repo_root,
+            args,
+            _volume_lock: volume_lock,
+        })
+    }
 
-/// After a successful add into the volume: leave a symlink where the user
-/// asked for the worktree, and remember the repository in the config.
-pub(crate) fn finish_placement(
-    p: &Placement,
-    common: &Path,
-    v: &Volume,
-    quiet: bool,
-) -> Result<()> {
-    let linked = cfg!(unix) && p.real != p.requested;
-    if p.real != p.requested && p.requested.is_dir() {
-        let _ = std::fs::remove_dir(&p.requested); // empty, checked before
-    }
-    #[cfg(unix)]
-    if linked {
-        if let Some(parent) = p.requested.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn finish(&self, v: &Volume, quiet: bool) -> Result<()> {
+        let linked = cfg!(unix) && self.real != self.requested;
+        if self.real != self.requested && self.requested.is_dir() {
+            let _ = std::fs::remove_dir(&self.requested);
         }
-        std::os::unix::fs::symlink(&p.real, &p.requested)
-            .with_context(|| format!("creating the symlink {}", p.requested.display()))?;
-    }
-    if !quiet {
-        eprintln!(
-            "sharetree: the worktree lives in volume '{}' at {}{}",
-            v.name,
-            p.real.display(),
-            if linked {
-                format!(" (symlink: {})", p.requested.display())
-            } else {
-                String::new()
+        #[cfg(unix)]
+        if linked {
+            if let Some(parent) = self.requested.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-        );
-    }
-    let mut cfg = Config::load()?;
-    if cfg.repo(common).is_none() {
-        cfg.repo_mut(common);
-        cfg.save()?;
-    }
-    Ok(())
-}
-
-/// Windows (and other non-unix): no clone engine; place in the Dev Drive
-/// when asked, otherwise plain git with a hint.
-#[cfg(not(unix))]
-fn run_without_engine(a: &AddArgs) -> Result<(i32, PathBuf)> {
-    let cwd = std::env::current_dir()?;
-    let dest = util::absolutize(Path::new(a.path.as_ref().expect("checked")), &cwd);
-    let why = "copy-on-write worktrees are not enabled on this platform (ReFS block cloning is off by default, see README)";
-    if a.no_cow || a.no_checkout || a.orphan || git::common_dir(&cwd).is_err() {
-        return Ok((delegate(a, why)?, dest));
-    }
-    let sel = select(a, &cwd, &dest, false)?;
-    match sel.decision {
-        Decision::Fail(m) => bail!(m),
-        Decision::IntoVolume(_) => {
-            let v = sel.volume.expect("decided with a volume");
-            let p = place(a, &cwd, &sel.common, &v)?;
-            let code = delegate(
-                &p.args,
-                "placing the worktree in the Dev Drive (sharetree does not block-clone on Windows yet)",
-            )?;
-            if code == 0 {
-                finish_placement(&p, &sel.common, &v, a.quiet)?;
-            }
-            Ok((code, p.real))
+            std::os::unix::fs::symlink(&self.real, &self.requested)
+                .with_context(|| format!("creating the symlink {}", self.requested.display()))?;
         }
-        Decision::Plain(h) => {
-            let code = delegate(a, why)?;
-            if let (Some(t), false) = (backend::hint_text(&h, "NTFS"), a.quiet) {
-                eprintln!("sharetree: {t}");
-            }
-            Ok((code, dest))
+        if !quiet {
+            eprintln!(
+                "sharetree: the worktree lives in volume '{}' at {}{}",
+                v.name,
+                self.real.display(),
+                if linked {
+                    format!(" (symlink: {})", self.requested.display())
+                } else {
+                    String::new()
+                }
+            );
         }
-        Decision::Reflink { .. } => Ok((delegate(a, why)?, dest)),
-        Decision::Ask(_) => unreachable!("resolved in select()"),
+        Ok(())
     }
 }
 
 /// Run stock `git worktree add` with the user's arguments, unchanged.
-pub fn delegate(a: &AddArgs, why: &str) -> Result<i32> {
+fn delegate(a: &AddArgs, cwd: &Path, why: &str) -> Result<i32> {
     if !a.quiet {
         eprintln!("sharetree: {why}; running plain `git worktree add`");
     }
-    let cwd = std::env::current_dir()?;
     let mut args: Vec<OsString> = Vec::new();
     if a.internal {
         args.extend(["-c".into(), "core.hooksPath=/dev/null".into()]);
     }
     args.extend(["worktree".into(), "add".into()]);
     args.extend(a.git_args.iter().cloned());
-    let st = git::run_inherit(&cwd, &args)?;
+    let st = git::run_inherit(cwd, &args)?;
     Ok(st.code().unwrap_or(1))
 }
 
@@ -507,17 +591,17 @@ mod engine {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::ExitStatus;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use anyhow::{bail, Context, Result};
 
-    use super::{delegate, AddArgs, Decision, DEFAULT_MIN_SIZE};
+    use super::{delegate, AddArgs, CloneProbe, DEFAULT_MIN_SIZE};
     use crate::attrs;
-    use crate::backend;
     use crate::git::{self, Entry, Tree, MODE_EXEC};
-    use crate::index::{self, IndexEntry, Stat};
+    use crate::index;
     use crate::reflink::{self, CloneError};
     use crate::util::{self, bytes_to_path, human, Trace};
     use crate::volume;
@@ -530,14 +614,14 @@ mod engine {
 
     struct Donor {
         path: PathBuf,
-        tree: Tree,
+        tree: Arc<Tree>,
         dirty: HashSet<Vec<u8>>,
         score: usize,
     }
 
     struct Analysis {
         sha: String,
-        target: Tree,
+        target: Arc<Tree>,
         donor: Option<Donor>,
     }
 
@@ -552,107 +636,26 @@ mod engine {
         unsupported: usize,
     }
 
-    use super::fs_label as fs_desc;
-
-    pub fn run(a: &AddArgs) -> Result<(i32, PathBuf)> {
-        let cwd = std::env::current_dir()?;
-        let dest_arg = a.path.as_ref().expect("checked by caller");
-        let dest = util::absolutize(Path::new(dest_arg), &cwd);
-        let plain = |why: &str| -> Result<(i32, PathBuf)> { Ok((delegate(a, why)?, dest.clone())) };
-        if a.no_cow {
-            return plain("--no-cow given");
-        }
-        if a.no_checkout {
-            return plain("--no-checkout: there is nothing to clone");
-        }
-        if a.orphan {
-            return plain("--orphan: there is nothing to clone");
-        }
-        if std::env::var_os("GIT_INDEX_FILE").is_some() {
-            return plain("GIT_INDEX_FILE is set");
-        }
-        if std::env::var_os("SHARETREE_FORCE_FALLBACK").is_some() {
-            return plain("SHARETREE_FORCE_FALLBACK is set");
-        }
-        if git::common_dir(&cwd).is_err() {
-            return plain("not inside a git repository");
-        }
-        if git::config_bool(&cwd, "core.splitIndex")? == Some(true) {
-            return plain("core.splitIndex is enabled");
-        }
-        for hook in ["reference-transaction", "post-index-change"] {
-            if git::hook_exists(&cwd, hook)? {
-                return plain(&format!("a {hook} hook is installed"));
-            }
-        }
-
-        // Probe beside the destination, never inside a directory that may
-        // already hold the user's files.
-        let anchor = util::nearest_existing(dest.parent().unwrap_or(&dest));
-        let t = Instant::now();
-        let probe = reflink::probe(&anchor);
-        let trace = Trace::new(a.verbose);
-        trace.phase("probe", t);
-
-        let sel = super::select(a, &cwd, &dest, probe.is_ok())?;
-        trace.note(format!("backend: {:?}", sel.decision));
-        match sel.decision {
-            Decision::Fail(m) => bail!(m),
-            Decision::Ask(_) => unreachable!("resolved in select()"),
-            Decision::Plain(h) => {
-                let why = probe
-                    .err()
-                    .unwrap_or_else(|| "a volume was not used".into());
-                let code = delegate(
-                    a,
-                    &format!(
-                        "{} ({}) cannot reflink: {why}",
-                        anchor.display(),
-                        fs_desc(&anchor)
-                    ),
-                )?;
-                if !a.quiet {
-                    if let Some(t) = backend::hint_text(&h, &fs_desc(&anchor)) {
-                        eprintln!("sharetree: {t}");
-                    }
-                }
-                return Ok((code, dest));
-            }
-            Decision::IntoVolume(_) => {
-                let v = sel.volume.expect("decided with a volume");
-                let p = super::place(a, &cwd, &sel.common, &v)?;
-                let mut a2 = p.args.clone();
-                a2.extra_donor = Some(ensure_seed(&cwd, &p.repo_root, a, &trace)?);
-                let (code, _) = run(&a2)?;
-                if code == 0 {
-                    super::finish_placement(&p, &sel.common, &v, a.quiet)?;
-                }
-                return Ok((code, p.real));
-            }
-            Decision::Reflink { seed: true } => {
-                // Already inside the volume: lock it and use the seed.
-                let v = sel.volume.expect("decided with a volume");
-                let p = super::place(a, &cwd, &sel.common, &v)?;
-                let mut a2 = p.args.clone();
-                a2.extra_donor = Some(ensure_seed(&cwd, &p.repo_root, a, &trace)?);
-                let (code, _) = run(&a2)?;
-                if code == 0 {
-                    super::finish_placement(&p, &sel.common, &v, true)?;
-                }
-                return Ok((code, p.real));
-            }
-            Decision::Reflink { seed: false } => {}
-        }
-        Ok((create(a, &cwd, &dest, &anchor, &trace)?, dest))
-    }
-
     /// The volume's seed for this repository: a detached, locked worktree at
     /// `<repo_root>/.sharetree-seed`. Created on first use (one full checkout,
     /// or reflinked from worktrees already in the volume), then advanced to
     /// the requested commit when it is clean, so the new worktree shares
     /// nearly every file with it.
-    fn ensure_seed(cwd: &Path, repo_root: &Path, a: &AddArgs, trace: &Trace) -> Result<PathBuf> {
+    pub(super) fn ensure_seed(
+        cwd: &Path,
+        repo_root: &Path,
+        a: &AddArgs,
+        trace: &Trace,
+    ) -> Result<PathBuf> {
         let seed = repo_root.join(volume::SEED_DIR);
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(seed.with_extension("lock"))
+            .with_context(|| format!("opening the volume seed lock in {}", repo_root.display()))?;
+        lock.lock()
+            .with_context(|| format!("locking the volume seed in {}", repo_root.display()))?;
         let rev = a
             .commitish
             .clone()
@@ -727,7 +730,8 @@ mod engine {
         };
         let sa = base.relocated(&seed, Some(volume::SEED_LOCK_REASON));
         let t = Instant::now();
-        let (code, _) = run(&sa)?;
+        let probe = CloneProbe::at(&seed, true, trace);
+        let code = probe.create(&sa, cwd, &seed, None, trace)?;
         trace.phase("seed", t);
         if code != 0 {
             bail!("creating the seed checkout {} failed", seed.display());
@@ -737,33 +741,39 @@ mod engine {
 
     /// The reflink engine proper: register, analyze donors, clone, verify,
     /// seed the index, check out the rest.
-    fn create(a: &AddArgs, cwd: &Path, dest: &Path, anchor: &Path, trace: &Trace) -> Result<i32> {
-        let cwd = cwd.to_path_buf();
-        let dest = dest.to_path_buf();
+    pub(super) fn create(
+        a: &AddArgs,
+        cwd: &Path,
+        dest: &Path,
+        anchor: &Path,
+        preferred_donor: Option<&Path>,
+        trace: &Trace,
+    ) -> Result<i32> {
         let dest_arg = a.path.as_ref().expect("checked by caller");
         let dev =
             util::device_id(anchor).context("cannot identify the destination's filesystem")?;
 
-        let wts = git::list_worktrees(&cwd)?;
+        let wts = git::list_worktrees(cwd)?;
         let cands = match &a.from {
             Some(from) => {
-                let from = util::absolutize(from, &cwd);
+                let from = cwd.join(from);
                 let top =
                     git::toplevel(&from).with_context(|| format!("--from {}", from.display()))?;
                 let head = git::rev_parse_commit(&top, OsStr::new("HEAD"))?;
                 if util::device_id(&top) != Some(dev) {
                     return delegate(
                         a,
+                        cwd,
                         "the --from worktree is on a different filesystem than the destination",
                     );
                 }
                 vec![Cand { path: top, head }]
             }
             None => {
-                let mut c = candidates(&wts, &cwd, &dest, dev);
+                let mut c = candidates(&wts, cwd, dest, dev);
                 // The volume's seed goes first: it is clean and at (or near)
                 // the target commit.
-                if let Some(seed) = &a.extra_donor {
+                if let Some(seed) = preferred_donor {
                     if let Some(w) = wts
                         .iter()
                         .find(|w| util::canon(&w.path) == util::canon(seed))
@@ -786,7 +796,7 @@ mod engine {
             }
         };
         if cands.is_empty() {
-            return delegate(a, "no donor worktree on the same filesystem");
+            return delegate(a, cwd, "no donor worktree on the same filesystem");
         }
         trace.note(format!(
             "candidates: {}",
@@ -803,7 +813,7 @@ mod engine {
             .commitish
             .clone()
             .unwrap_or_else(|| OsString::from("HEAD"));
-        let guess = git::rev_parse_commit(&cwd, &guess_rev).ok();
+        let guess = git::rev_parse_commit(cwd, &guess_rev).ok();
         let mut add_args: Vec<OsString> =
             vec!["worktree".into(), "add".into(), "--no-checkout".into()];
         add_args.extend(a.forward.iter().cloned());
@@ -814,21 +824,30 @@ mod engine {
         if let Some(c) = &a.commitish {
             add_args.push(c.clone());
         }
+        let lock = match register_lock(cwd) {
+            Ok(lock) => lock,
+            Err(e) => {
+                let detail = if e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::Unsupported)
+                {
+                    format!("filesystem locking is unavailable for worktree registration: {e:#}")
+                } else {
+                    format!("cannot lock worktree registration: {e:#}")
+                };
+                return delegate(a, cwd, &detail);
+            }
+        };
         let explicit = a.from.is_some();
         let t = Instant::now();
         let (status, early) = std::thread::scope(|s| {
-            let h = s.spawn(|| {
-                // Concurrent `git worktree add` calls race: one can read another's
-                // half-written `worktrees/<id>/commondir` and die with "failed to
-                // read ... commondir" (reproduced with stock git, ~1 in 800).
-                // Serialize our own registrations; the lock is advisory, so it
-                // only orders sharetree against sharetree.
-                let _lock = register_lock(&cwd);
-                git::run_inherit(&cwd, &add_args)
+            let h = s.spawn(move || {
+                let _lock = lock;
+                git::run_inherit(cwd, &add_args)
             });
             let early = guess
                 .as_deref()
-                .map(|sha| analyze(&cwd, sha, &cands, explicit, trace));
+                .map(|sha| analyze(cwd, sha, &cands, explicit, trace));
             (h.join().expect("git worktree add thread"), early)
         });
         let status = status?;
@@ -837,67 +856,43 @@ mod engine {
         }
         trace.phase("register+scan", t);
 
-        let target = git::rev_parse_commit(&dest, OsStr::new("HEAD"))?;
-        let analysis = match early {
-            Some(Ok(an)) if an.sha == target => Ok(an),
-            _ => analyze(&cwd, &target, &cands, explicit, trace),
-        };
-
-        let report = match analysis {
-            Ok(an) => seed(&dest, &an, a, trace).unwrap_or_else(|e| {
-                eprintln!("sharetree: warning: seeding skipped: {e:#}");
-                SeedReport::default()
-            }),
+        let prepared = (|| -> Result<_> {
+            let target = git::rev_parse_commit(dest, OsStr::new("HEAD"))?;
+            let analysis = match early {
+                Some(Ok(an)) if an.sha == target => Ok(an),
+                _ => analyze(cwd, &target, &cands, explicit, trace),
+            };
+            let mut report = analysis
+                .and_then(|an| seed(dest, &an, a, trace))
+                .unwrap_or_else(|e| {
+                    eprintln!("sharetree: warning: seeding skipped: {e:#}");
+                    SeedReport::default()
+                });
+            let t = Instant::now();
+            let status = checkout(dest, a, &mut report)?;
+            trace.phase("checkout", t);
+            Ok((status, target, report))
+        })();
+        // Git removes its unfinished checkout but keeps the branch, if
+        // any. After checkout succeeds a hook failure keeps the worktree.
+        let (target, report) = match prepared {
+            Ok((status, target, report)) if status.success() => (target, report),
+            Ok((status, _, _)) => {
+                rollback_registration(cwd, dest);
+                return Ok(status.code().unwrap_or(1));
+            }
             Err(e) => {
-                eprintln!("sharetree: warning: donor analysis failed: {e:#}");
-                SeedReport::default()
+                rollback_registration(cwd, dest);
+                return Err(e);
             }
         };
-
-        // Finalize: git writes everything we did not vouch for.
-        let t = Instant::now();
-        if let Err(first) = checkout(&dest) {
-            if !report.index_written {
-                return Err(first);
-            }
-            eprintln!("sharetree: warning: git rejected the seeded index ({first:#}); retrying a plain checkout");
-            let idx = git::git_path(&dest, "index")?;
-            for p in [
-                idx.clone(),
-                PathBuf::from(format!("{}.lock", idx.display())),
-            ] {
-                match fs::remove_file(&p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).context("removing the seeded index"),
-                }
-            }
-            checkout(&dest)?;
-        }
-        trace.phase("checkout", t);
-
-        // Belt and braces (git-twig RFD0024): the index must equal the commit.
-        if !git::succeeds(&dest, &["diff-index", "--cached", "--quiet", "HEAD", "--"]) {
-            eprintln!("sharetree: warning: index differs from HEAD after checkout; resetting");
-            git::output(
-                &dest,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "reset",
-                    "-q",
-                    "--hard",
-                    "HEAD",
-                ],
-            )?;
-        }
 
         let zero = "0".repeat(target.len());
         let hook_code = if a.internal {
             0
         } else {
             let h = git::run_inherit(
-                &dest,
+                dest,
                 &[
                     "hook",
                     "run",
@@ -917,7 +912,7 @@ mod engine {
         };
 
         if !a.quiet {
-            summary(&dest, &report);
+            summary(dest, &report);
         }
         trace.total();
 
@@ -925,7 +920,7 @@ mod engine {
             match &report.donor {
                 Some(donor) if report.verified > 0 || report.planned == 0 => {
                     #[cfg(unix)]
-                    crate::warm::run(donor, &dest, &wts, a.quiet, trace)?;
+                    crate::warm::run(donor, dest, &wts, a.quiet, trace)?;
                     #[cfg(not(unix))]
                     {
                         let _ = (donor, &wts);
@@ -938,19 +933,43 @@ mod engine {
         Ok(hook_code)
     }
 
-    /// Exclusive advisory lock on `<common-dir>/sharetree-register.lock`, held for
-    /// the duration of one `git worktree add`. Best effort: any failure to lock
-    /// just means we run unserialized, as stock git does.
-    fn register_lock(cwd: &Path) -> Option<fs::File> {
-        let dir = git::common_dir(cwd).ok()?;
+    fn rollback_registration(cwd: &Path, dest: &Path) {
+        let _lock = register_lock(cwd)
+            .inspect_err(|e| {
+                eprintln!(
+                    "sharetree: warning: cannot lock worktree registration for cleanup: {e:#}"
+                );
+            })
+            .ok();
+        let removed = git::output(
+            cwd,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                OsStr::new("--force"),
+                OsStr::new("--"),
+                dest.as_os_str(),
+            ],
+        );
+        if let Err(e) = removed {
+            eprintln!("sharetree: warning: could not remove the unfinished worktree: {e:#}");
+        }
+    }
+
+    // Concurrent Git registrations can observe another add's incomplete
+    // commondir. This advisory lock coordinates sharetree registrations.
+    fn register_lock(cwd: &Path) -> Result<fs::File> {
+        let path = git::common_dir(cwd)?.join("sharetree-register.lock");
         let f = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join("sharetree-register.lock"))
-            .ok()?;
-        f.lock().ok()?;
-        Some(f)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        f.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(f)
     }
 
     fn summary(dest: &Path, r: &SeedReport) {
@@ -1044,38 +1063,51 @@ mod engine {
                 heads.push(&c.head);
             }
         }
-        let mut trees: HashMap<String, Tree> = std::thread::scope(|s| {
+        let mut trees: HashMap<String, Arc<Tree>> = std::thread::scope(|s| {
             let hs: Vec<_> = heads
                 .iter()
                 .map(|h| s.spawn(move || (h.to_string(), git::ls_tree(repo, h))))
                 .collect();
             hs.into_iter()
                 .filter_map(|h| h.join().ok())
-                .filter_map(|(h, t)| t.ok().map(|t| (h, t)))
+                .filter_map(|(h, t)| t.ok().map(|t| (h, Arc::new(t))))
                 .collect()
         });
         let target = match trees.remove(sha) {
             Some(t) => t,
-            None => git::ls_tree(repo, sha)
-                .with_context(|| format!("cannot list the target tree {sha}"))?,
+            None => Arc::new(
+                git::ls_tree(repo, sha)
+                    .with_context(|| format!("cannot list the target tree {sha}"))?,
+            ),
         };
-        let score_of = |tree: &Tree| {
-            target
-                .entries
+        let mut wanted: HashMap<&str, usize> = HashMap::new();
+        let mut regular_files = 0;
+        for entry in target.entries.values().filter(|e| e.is_regular()) {
+            *wanted.entry(&entry.oid).or_default() += 1;
+            regular_files += 1;
+        }
+        let score_of = |tree: &Tree, dirty: Option<&HashSet<Vec<u8>>>| {
+            let mut seen = HashSet::new();
+            tree.entries
                 .iter()
-                .filter(|(p, e)| {
-                    e.is_regular() && tree.entries.get(*p).is_some_and(|d| d.oid == e.oid)
-                })
-                .count()
+                .filter(|(p, e)| e.is_regular() && dirty.is_none_or(|paths| !paths.contains(*p)))
+                .filter_map(|(_, e)| wanted.get_key_value(e.oid.as_str()))
+                .filter(|(oid, _)| seen.insert(**oid))
+                .map(|(_, &count)| count)
+                .sum::<usize>()
         };
+        let scores: HashMap<&str, usize> = trees
+            .iter()
+            .map(|(head, tree)| (head.as_str(), score_of(tree, None)))
+            .collect();
         let mut ranked: Vec<(usize, usize, &Cand)> = cands
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let score = if c.head == sha {
-                    target.regular_count()
+                    regular_files
                 } else {
-                    trees.get(&c.head).map_or(0, score_of)
+                    scores.get(c.head.as_str()).copied().unwrap_or(0)
                 };
                 (score, i, c)
             })
@@ -1084,18 +1116,18 @@ mod engine {
         trace.phase("score donors", t);
 
         let mut donor = None;
+        let mut best_score = 0;
         for (score, _, c) in ranked.into_iter().take(3) {
-            if score == 0 {
+            // A candidate's tree score is an upper bound before dirty
+            // paths are excluded; the current donor already beats this.
+            if score <= best_score {
                 break;
             }
             let t = Instant::now();
             let tree = if c.head == sha {
-                target.clone()
+                &target
             } else {
-                match trees.remove(&c.head) {
-                    Some(t) => t,
-                    None => git::ls_tree(repo, &c.head)?,
-                }
+                &trees[&c.head]
             };
             // Tracked files that differ from the donor's HEAD (by its stat
             // cache: a filter only, every clone is hashed later).
@@ -1108,23 +1140,41 @@ mod engine {
                     }
                 };
             trace.phase("donor status", t);
-            // A worktree mid-checkout reads as mostly dirty: useless as a donor.
-            if !explicit && dirty.len() * 2 > tree.regular_count() {
+            // A worktree mid-checkout reads as mostly dirty. Count only
+            // regular donor paths, which are the paths we can clone.
+            let dirty_regular = dirty
+                .iter()
+                .filter(|path| tree.entries.get(*path).is_some_and(Entry::is_regular))
+                .count();
+            let total = if c.head == sha {
+                regular_files
+            } else {
+                tree.regular_count()
+            };
+            if !explicit && dirty_regular > total / 2 {
                 trace.note(format!(
                     "skipping donor {}: {} of {} tracked files differ from its HEAD",
                     c.path.display(),
-                    dirty.len(),
-                    tree.regular_count()
+                    dirty_regular,
+                    total
                 ));
                 continue;
             }
+            let score = if dirty_regular == 0 {
+                score
+            } else {
+                score_of(tree, Some(&dirty))
+            };
+            if score <= best_score {
+                continue;
+            }
+            best_score = score;
             donor = Some(Donor {
                 path: c.path.clone(),
-                tree,
+                tree: Arc::clone(tree),
                 dirty,
                 score,
             });
-            break;
         }
         Ok(Analysis {
             sha: sha.to_string(),
@@ -1139,6 +1189,76 @@ mod engine {
         entry: &'a Entry,
     }
 
+    /// We create files before Git's checkout sees them. Leave names whose
+    /// path semantics or Git-directory protections are ambiguous to Git.
+    fn reusable_tree_path(path: &[u8]) -> bool {
+        let name = std::str::from_utf8(path);
+        if name.as_ref().is_ok_and(|name| {
+            name.chars().any(|c| {
+                matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
+            })
+        }) {
+            return false;
+        }
+        if path
+            .split(|b| matches!(b, b'/' | b'\\' | b':'))
+            .any(|part| {
+                let mut end = part.len();
+                while end > 0 && matches!(part[end - 1], b'.' | b' ') {
+                    end -= 1;
+                }
+                let part = &part[..end];
+                part.eq_ignore_ascii_case(b".git") || part.eq_ignore_ascii_case(b"git~1")
+            })
+        {
+            return false;
+        }
+        if cfg!(windows) && name.is_err() {
+            return false;
+        }
+        path.split(|&b| b == b'/').all(|part| {
+            !part.is_empty()
+                && !matches!(part, b"." | b"..")
+                && !part.contains(&0)
+                && (!cfg!(windows) || reusable_windows_component(part))
+        })
+    }
+
+    fn reusable_windows_component(part: &[u8]) -> bool {
+        if part
+            .iter()
+            .any(|b| b.is_ascii_control() || b"<>:\"\\|?*~".contains(b))
+            || part.last().is_some_and(|b| matches!(b, b'.' | b' '))
+        {
+            return false;
+        }
+        let stem = part
+            .split(|&b| b == b'.')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_end();
+        if [
+            b"CON".as_slice(),
+            b"PRN",
+            b"AUX",
+            b"NUL",
+            b"CONIN$",
+            b"CONOUT$",
+        ]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
+            return false;
+        }
+        let numbered_device = stem.get(..3).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(b"COM") || prefix.eq_ignore_ascii_case(b"LPT")
+        }) && matches!(
+            stem.get(3..),
+            Some([b'0'..=b'9'] | b"\xc2\xb9" | b"\xc2\xb2" | b"\xc2\xb3")
+        );
+        !numbered_device
+    }
+
     fn seed(dest: &Path, an: &Analysis, a: &AddArgs, trace: &Trace) -> Result<SeedReport> {
         let mut report = SeedReport::default();
         let Some(d) = &an.donor else {
@@ -1151,13 +1271,14 @@ mod engine {
         // Clean donor files by blob id, to also reuse renamed/moved files.
         let mut by_oid: HashMap<&str, &[u8]> = HashMap::new();
         for (p, e) in &d.tree.entries {
-            if e.is_regular() && !d.dirty.contains(p) {
-                by_oid.entry(e.oid.as_str()).or_insert(p.as_slice());
+            if e.is_regular() && !d.dirty.contains(p) && reusable_tree_path(p) {
+                let donor_path = by_oid.entry(e.oid.as_str()).or_insert(p.as_slice());
+                *donor_path = (*donor_path).min(p);
             }
         }
         let mut plan: Vec<Planned> = Vec::new();
         for (p, e) in &an.target.entries {
-            if !e.is_regular() || e.size < a.min_size {
+            if !e.is_regular() || e.size < a.min_size || !reusable_tree_path(p) {
                 continue;
             }
             let src = match d.tree.entries.get(p) {
@@ -1177,21 +1298,10 @@ mod engine {
         }
         plan.sort_by(|x, y| x.dst.cmp(y.dst));
 
-        if git::config_bool(dest, "core.sparseCheckout")? == Some(true) && !plan.is_empty() {
-            let mut input = Vec::new();
-            for p in &plan {
-                input.extend_from_slice(p.dst);
-                input.push(0);
-            }
-            let out =
-                git::output_with_input(dest, &["sparse-checkout", "check-rules", "-z"], &input)?;
-            let keep: HashSet<Vec<u8>> = git::split_z(&out).into_iter().collect();
-            plan.retain(|p| keep.contains(p.dst));
-        }
         if !plan.is_empty() {
             let paths: Vec<&[u8]> = plan.iter().map(|p| p.dst).collect();
-            let raw = attrs::raw_paths(dest, &an.sha, &paths)?;
-            plan.retain(|p| raw.contains(p.dst));
+            let reusable = attrs::reusable_paths(dest, &an.sha, &paths)?;
+            plan.retain(|p| reusable.contains(p.dst));
         }
         report.planned = plan.len();
         trace.phase("plan", t);
@@ -1268,10 +1378,14 @@ mod engine {
             }
         });
         let mut cloned = cloned.into_inner().expect("lock");
+        // Keep hashing reads in path order.
         cloned.sort_unstable();
         report.cloned = cloned.len();
         report.unsupported = unsupported.load(Ordering::Relaxed);
         trace.phase("clone", t);
+        if cloned.is_empty() {
+            return Ok(report);
+        }
 
         // Verify: hash every clone's own bytes in-process against the target
         // blob. Measured alternatives, all slower or no faster on Btrfs and
@@ -1281,7 +1395,7 @@ mod engine {
         let t = Instant::now();
         let fmt = git::object_format(dest)?;
         let next = AtomicUsize::new(0);
-        let verified: Mutex<Vec<(usize, Stat)>> = Mutex::new(Vec::with_capacity(cloned.len()));
+        let verified = Mutex::new(Vec::with_capacity(cloned.len()));
         std::thread::scope(|s| {
             for _ in 0..hash_workers(cloned.len()) {
                 s.spawn(|| {
@@ -1290,59 +1404,22 @@ mod engine {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&i) = cloned.get(k) else { break };
                         let p = &plan[i];
-                        let full = dest.join(bytes_to_path(p.dst));
-                        match index::hex_to_raw(&p.entry.oid)
-                            .and_then(|w| verify_clone(&full, p.entry, &w, fmt))
-                        {
-                            Some(st) => mine.push((i, st)),
-                            None => {
-                                let _ = fs::remove_file(&full);
-                            }
+                        if let Some(clone) = index::verify_clone(dest, p.dst, p.entry, fmt) {
+                            mine.push(clone);
                         }
                     }
                     verified.lock().expect("lock").extend(mine);
                 });
             }
         });
-        let mut verified = verified.into_inner().expect("lock");
-        verified.sort_unstable_by_key(|v| v.0);
+        let verified = verified.into_inner().expect("lock");
         trace.phase("verify", t);
 
-        // A verified clone enters the index only if its stat data has not
-        // moved since it was hashed.
-        let mut entries = Vec::with_capacity(verified.len());
-        for (i, st) in &verified {
-            let p = &plan[*i];
-            let full = dest.join(bytes_to_path(p.dst));
-            let still = fs::symlink_metadata(&full)
-                .ok()
-                .map(|m| Stat::from_metadata(&m));
-            if still == Some(*st) {
-                report.bytes += p.entry.size;
-                entries.push(IndexEntry {
-                    path: p.dst.to_vec(),
-                    mode: p.entry.mode,
-                    oid: index::hex_to_raw(&p.entry.oid).context("bad object id")?,
-                    stat: *st,
-                });
-            } else {
-                let _ = fs::remove_file(&full);
-            }
-        }
-        report.verified = entries.len();
-
-        if entries.is_empty() {
-            report.bytes = 0;
-            return Ok(report);
-        }
-
         let t = Instant::now();
-        let idx = git::git_path(dest, "index")?;
-        if idx.exists() {
-            bail!("{} already exists", idx.display());
-        }
-        index::write(&idx, &mut entries, fmt)?;
-        report.index_written = true;
+        let seeded = index::seed_worktree(dest, verified, fmt)?;
+        report.verified = seeded.entries;
+        report.bytes = seeded.bytes;
+        report.index_written = seeded.entries != 0;
         trace.phase("write index", t);
         Ok(report)
     }
@@ -1354,54 +1431,79 @@ mod engine {
         cpus.clamp(4, 16).min(n_items.max(1))
     }
 
-    /// Hash the clone at `path` in-process and compare with the target blob.
-    /// Returns its stat data when type, size, exec bit and content all match
-    /// and the stat data did not move while it was read.
-    fn verify_clone(
-        path: &Path,
-        entry: &Entry,
-        want: &[u8],
-        fmt: git::ObjectFormat,
-    ) -> Option<Stat> {
-        let mut f = reflink::open_no_follow(path).ok()?;
-        let m1 = f.metadata().ok()?;
-        if !reflink::is_plain_file(&m1)
-            || m1.len() != entry.size
-            || !util::exec_bit_matches(&m1, entry.mode == MODE_EXEC)
+    fn checkout(dest: &Path, a: &AddArgs, report: &mut SeedReport) -> Result<ExitStatus> {
+        let mut git = git::cmd(dest);
+        git.args(["-c", "checkout.workers=0"]);
+        if a.internal {
+            git.args(["-c", "core.hooksPath=/dev/null"]);
+        }
+        git.args(["reset", "--hard", "--no-recurse-submodules"]);
+        if a.quiet {
+            git.arg("--quiet");
+        }
+        git.stdin(std::process::Stdio::null());
+
+        let mut status = git.status().context("failed to run git reset")?;
+        if !status.success()
+            && report.index_written
+            && !git::succeeds(dest, &["ls-files", "--cached", "--"])
         {
-            return None;
+            eprintln!(
+                "sharetree: warning: git rejected the seeded index; retrying a plain checkout"
+            );
+            fs::remove_file(git::git_path(dest, "index")?).context("removing the seeded index")?;
+            report.index_written = false;
+            report.cloned = 0;
+            report.verified = 0;
+            report.bytes = 0;
+            status = git.status().context("failed to run git reset")?;
         }
-        let oid = crate::hash::blob_oid(&mut f, entry.size, fmt).ok()??;
-        if oid != want {
-            return None;
+
+        if status.success()
+            && report.index_written
+            && !git::succeeds(dest, &["diff-index", "--cached", "--quiet", "HEAD", "--"])
+        {
+            eprintln!("sharetree: warning: index differs from HEAD after checkout; resetting");
+            status = git.status().context("failed to run git reset")?;
         }
-        let s1 = Stat::from_metadata(&m1);
-        let s2 = Stat::from_metadata(&f.metadata().ok()?);
-        (s1 == s2).then_some(s1)
+        Ok(status)
     }
 
-    fn checkout(dest: &Path) -> Result<()> {
-        let out = git::cmd(dest)
-            .args([
-                "-c",
-                "checkout.workers=0",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "checkout",
-                "-q",
-                "-f",
-                "HEAD",
-            ])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("failed to run git checkout")?;
-        if !out.status.success() {
-            bail!(
-                "git checkout -f HEAD: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+    #[cfg(test)]
+    mod tests {
+        use super::{reusable_tree_path, reusable_windows_component};
+
+        #[test]
+        fn clone_paths_require_normal_relative_components() {
+            assert!(reusable_tree_path(b"src/sub directory/file.rs"));
+            assert!(reusable_tree_path(b"src/REPO.GIT/file"));
+            for path in [
+                b"".as_slice(),
+                b"src//file",
+                b"/absolute",
+                b"src/./file",
+                b"src/../file",
+                b"src/",
+                b"src/repo/.git/config",
+            ] {
+                assert!(!reusable_tree_path(path), "{path:?}");
+            }
         }
-        Ok(())
+
+        #[test]
+        fn windows_path_components_exclude_reserved_names() {
+            assert!(reusable_windows_component(b"source.rs"));
+            assert!(reusable_windows_component(b"component.rs"));
+            for name in [
+                b"bad:name".as_slice(),
+                b"bad\\name",
+                b"name.",
+                b"NUL.txt",
+                b"COM1",
+            ] {
+                assert!(!reusable_windows_component(name), "{name:?}");
+            }
+        }
     }
 }
 
@@ -1432,6 +1534,9 @@ mod tests {
         let a = parse(&os(&["--no-checkout", "--checkout", "wt"])).unwrap();
         assert!(!a.no_checkout);
         assert!(a.forward.is_empty());
+        let abbreviated = parse(&os(&["--check", "--no-check", "wt"])).unwrap();
+        assert!(abbreviated.no_checkout);
+        assert!(abbreviated.forward.is_empty());
     }
 
     #[test]

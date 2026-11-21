@@ -45,11 +45,13 @@ impl Opts {
                 "a Dev Drive must be at least 50 GB (the VHDX is dynamically expanding, so this is a cap, not a cost)"
             );
         }
-        if self.label.is_empty() || self.label.len() > 32 {
+        if self.label.is_empty() || self.label.encode_utf16().count() > 32 {
             bail!("--label must be 1-32 characters");
         }
-        if !self.vhdx.to_ascii_lowercase().ends_with(".vhdx") {
-            bail!("the image path must end in .vhdx");
+        if !self.vhdx.to_ascii_lowercase().ends_with(".vhdx")
+            || self.vhdx.contains(['\0', '\n', '\r', '"'])
+        {
+            bail!("--vhdx must be a valid Windows image path ending in .vhdx");
         }
         Ok(())
     }
@@ -168,11 +170,14 @@ try {{
     }}
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Vhdx) | Out-Null
 
-    $dp = Join-Path $env:TEMP 'sharetree-diskpart.txt'
-    Set-Content -LiteralPath $dp -Encoding ASCII -Value "create vdisk file=`"$Vhdx`" maximum=$SizeMB type=expandable"
-    diskpart /s $dp | Out-Host
-    $code = $LASTEXITCODE
-    Remove-Item -LiteralPath $dp -ErrorAction SilentlyContinue
+    $dp = [System.IO.Path]::GetTempFileName()
+    try {{
+        Set-Content -LiteralPath $dp -Encoding ASCII -Value "create vdisk file=`"$Vhdx`" maximum=$SizeMB type=expandable"
+        diskpart /s $dp | Out-Host
+        $code = $LASTEXITCODE
+    }} finally {{
+        Remove-Item -LiteralPath $dp -ErrorAction SilentlyContinue
+    }}
     if ($code -ne 0) {{ throw "diskpart create vdisk failed (exit $code)" }}
 
     $img = Mount-DiskImage -ImagePath $Vhdx -PassThru
@@ -214,9 +219,26 @@ try {{
 }
 
 /// Undo setup: remove the task, detach the VHDX, optionally delete it.
-pub fn teardown_script(o: &Opts, delete_image: bool) -> String {
+pub fn teardown_script(o: &Opts, delete_image: bool, force: bool) -> String {
+    let inspect = if delete_image && !force {
+        r#"    if ($img) {
+        if (-not $img.Attached) { throw 'the Dev Drive is detached; mount it to check for worktrees, or pass --force' }
+        $part = $img | Get-Disk | Get-Partition | Where-Object { $_.Type -eq 'Basic' } | Select-Object -First 1
+        if (-not $part -or [int]$part.DriveLetter -eq 0) { throw 'cannot inspect the Dev Drive; assign its partition a letter, or pass --force' }
+        $root = Join-Path "$($part.DriveLetter):\" 'sharetree'
+        if (Test-Path -LiteralPath $root) {
+            $items = Get-ChildItem -LiteralPath $root -Directory -Force | ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Force | Select-Object -First 1
+            } | Select-Object -First 1
+            if ($items) { throw 'the Dev Drive holds worktree data; remove the worktrees first, or pass --force' }
+        }
+    }
+"#
+    } else {
+        ""
+    };
     let delete = if delete_image {
-        "    Remove-Item -LiteralPath $Vhdx -Force\n"
+        "    if ($img) { Remove-Item -LiteralPath $Vhdx -Force }\n"
     } else {
         ""
     };
@@ -226,9 +248,11 @@ pub fn teardown_script(o: &Opts, delete_image: bool) -> String {
          $Vhdx = {vhdx}\n\
          $ResultFile = {result}\n\
          try {{\n\
-         \x20   Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue\n\
-         \x20   if ((Get-DiskImage -ImagePath $Vhdx).Attached) {{ Dismount-DiskImage -ImagePath $Vhdx | Out-Null }}\n\
+         \x20   $img = if (Test-Path -LiteralPath $Vhdx) {{ Get-DiskImage -ImagePath $Vhdx }}\n\
+         {inspect}\
+         \x20   if ($img.Attached) {{ Dismount-DiskImage -ImagePath $Vhdx | Out-Null }}\n\
          {delete}\
+         \x20   Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue\n\
          \x20   Set-Content -LiteralPath $ResultFile -Value 'ok' -Encoding UTF8\n\
          }} catch {{\n\
          \x20   Set-Content -LiteralPath $ResultFile -Value \"error $($_.Exception.Message)\" -Encoding UTF8\n\
@@ -244,7 +268,7 @@ pub fn teardown_script(o: &Opts, delete_image: bool) -> String {
 /// The command line that runs `script` elevated (UAC prompt) and waits.
 pub fn elevate_command(script_path: &str) -> String {
     format!(
-        "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{})",
+        "$ErrorActionPreference = 'Stop'; Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{})",
         ps_quote(&format!("\"{script_path}\""))
     )
 }
@@ -252,10 +276,15 @@ pub fn elevate_command(script_path: &str) -> String {
 /// Parse the result file the scripts write.
 pub fn parse_result(text: &str) -> Result<Option<char>> {
     let t = text.trim_start_matches('\u{feff}').trim();
-    if let Some(rest) = t.strip_prefix("ok") {
-        return Ok(rest.trim().chars().next());
+    if t == "ok" {
+        return Ok(None);
     }
-    if let Some(msg) = t.strip_prefix("error") {
+    if let Some(rest) = t.strip_prefix("ok ") {
+        if rest.len() == 1 && rest.as_bytes()[0].is_ascii_uppercase() {
+            return Ok(rest.chars().next());
+        }
+    }
+    if let Some(msg) = t.strip_prefix("error ") {
         bail!("the Dev Drive script failed: {}", msg.trim());
     }
     bail!("the Dev Drive script did not finish (was the UAC prompt declined?)")
@@ -351,12 +380,18 @@ mod tests {
     #[test]
     fn teardown_script_deletes_only_when_asked() {
         let o = opts();
-        let keep = teardown_script(&o, false);
-        let del = teardown_script(&o, true);
+        let keep = teardown_script(&o, false, false);
+        let del = teardown_script(&o, true, false);
+        let forced = teardown_script(&o, true, true);
         assert!(keep.contains("Unregister-ScheduledTask -TaskName 'sharetree-devdrive'"));
         assert!(keep.contains("Dismount-DiskImage"));
         assert!(!keep.contains("Remove-Item"));
         assert!(del.contains("Remove-Item -LiteralPath $Vhdx -Force"));
+        assert!(
+            del.find("the Dev Drive holds worktree data").unwrap()
+                < del.find("Dismount-DiskImage").unwrap()
+        );
+        assert!(!forced.contains("the Dev Drive holds worktree data"));
         assert_eq!(del.matches('{').count(), del.matches('}').count());
     }
 
@@ -376,7 +411,7 @@ mod tests {
     #[test]
     fn elevation_and_results() {
         let c = elevate_command(r"C:\Users\me\AppData\Local\sharetree\setup-devdrive.ps1");
-        assert!(c.starts_with("Start-Process -FilePath powershell.exe -Verb RunAs -Wait"));
+        assert!(c.contains("Start-Process -FilePath powershell.exe -Verb RunAs -Wait"));
         assert!(
             c.contains(r#"'"C:\Users\me\AppData\Local\sharetree\setup-devdrive.ps1"'"#),
             "{c}"
@@ -388,5 +423,7 @@ mod tests {
             .to_string()
             .contains("drive Q: is in use"));
         assert!(parse_result("").is_err());
+        assert!(parse_result("okay").is_err());
+        assert!(parse_result("ok QA").is_err());
     }
 }

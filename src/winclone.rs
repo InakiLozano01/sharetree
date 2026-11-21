@@ -21,12 +21,8 @@
 //!   sample does; the destination keeps its exact length.
 //!
 //! Every clone is still hashed against the target blob before it enters the
-//! index (`add.rs`), so a wrong clone costs a rewrite by git, never a wrong
+//! index (`index.rs`), so a wrong clone costs a rewrite by git, never a wrong
 //! file in the worktree.
-//!
-//! Index stat data follows Git for Windows (`compat/mingw.c`): ctime is the
-//! file's *creation* time, mtime its last-write time, both with 100 ns
-//! resolution; dev, ino, uid and gid are 0: `git_stat` (portable).
 
 // The portable helpers are used only by the Windows engine.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -50,35 +46,6 @@ pub fn clone_regions(len: u64, cluster: u64) -> Vec<(u64, u64)> {
         off += n;
     }
     v
-}
-
-/// 100 ns intervals between 1601-01-01 (FILETIME epoch) and 1970-01-01.
-const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
-
-/// FILETIME → (seconds, nanoseconds) since the Unix epoch, as Git for
-/// Windows' `filetime_to_timespec` computes it.
-pub fn filetime_to_unix(ft: u64) -> (i64, u32) {
-    let t = ft as i64 - EPOCH_DIFF_100NS as i64;
-    let secs = t.div_euclid(10_000_000);
-    let nsec = (t.rem_euclid(10_000_000) * 100) as u32;
-    (secs, nsec)
-}
-
-/// The stat fields Git for Windows stores in the index for a regular file.
-pub fn git_stat(creation: u64, last_write: u64, size: u64) -> crate::index::Stat {
-    let (cs, cns) = filetime_to_unix(creation);
-    let (ms, mns) = filetime_to_unix(last_write);
-    crate::index::Stat {
-        ctime_s: cs as u32,
-        ctime_ns: cns,
-        mtime_s: ms as u32,
-        mtime_ns: mns,
-        dev: 0,
-        ino: 0,
-        uid: 0,
-        gid: 0,
-        size: size as u32,
-    }
 }
 
 pub const NOTE: &str = "Windows block cloning (FSCTL_DUPLICATE_EXTENTS_TO_FILE) is \
@@ -201,17 +168,24 @@ mod sys {
         Ok(c)
     }
 
-    fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<u32> {
+    unsafe fn ioctl(
+        h: HANDLE,
+        code: u32,
+        input: *const c_void,
+        input_size: u32,
+        output: *mut c_void,
+        output_size: u32,
+    ) -> io::Result<u32> {
         let mut returned = 0u32;
         // SAFETY: buffers are valid for their lengths; synchronous handle.
         let ok = unsafe {
             DeviceIoControl(
                 h,
                 code,
-                input.as_ptr() as *const c_void,
-                input.len() as u32,
-                output.as_mut_ptr() as *mut c_void,
-                output.len() as u32,
+                input,
+                input_size,
+                output,
+                output_size,
                 &mut returned,
                 std::ptr::null_mut(),
             )
@@ -222,35 +196,52 @@ mod sys {
         Ok(returned)
     }
 
-    fn as_bytes<T>(v: &T) -> &[u8] {
-        // SAFETY: plain-old-data structs from windows-sys.
-        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
-    }
-
     /// Give `dst` the source's integrity-stream and sparse settings.
     fn match_attributes(src: &File, dst: &File, src_attrs: u32) -> io::Result<()> {
-        let mut info: FSCTL_GET_INTEGRITY_INFORMATION_BUFFER = unsafe { std::mem::zeroed() };
-        // SAFETY: the output buffer is the documented struct.
-        let out = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut info as *mut _ as *mut u8,
-                std::mem::size_of::<FSCTL_GET_INTEGRITY_INFORMATION_BUFFER>(),
-            )
+        let mut info = FSCTL_GET_INTEGRITY_INFORMATION_BUFFER::default();
+        let info_size = std::mem::size_of_val(&info) as u32;
+        let returned = unsafe {
+            ioctl(
+                handle(src),
+                FSCTL_GET_INTEGRITY_INFORMATION,
+                std::ptr::null(),
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                info_size,
+            )?
         };
-        ioctl(handle(src), FSCTL_GET_INTEGRITY_INFORMATION, &[], out)?;
+        if returned < info_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete ReFS integrity information",
+            ));
+        }
         let set = FSCTL_SET_INTEGRITY_INFORMATION_BUFFER {
             ChecksumAlgorithm: info.ChecksumAlgorithm,
             Reserved: 0,
             Flags: info.Flags,
         };
-        ioctl(
-            handle(dst),
-            FSCTL_SET_INTEGRITY_INFORMATION,
-            as_bytes(&set),
-            &mut [],
-        )?;
+        unsafe {
+            ioctl(
+                handle(dst),
+                FSCTL_SET_INTEGRITY_INFORMATION,
+                std::ptr::from_ref(&set).cast(),
+                std::mem::size_of_val(&set) as u32,
+                std::ptr::null_mut(),
+                0,
+            )?;
+        }
         if src_attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
-            ioctl(handle(dst), FSCTL_SET_SPARSE, &[], &mut [])?;
+            unsafe {
+                ioctl(
+                    handle(dst),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )?;
+            }
         }
         Ok(())
     }
@@ -316,12 +307,16 @@ mod sys {
                     TargetFileOffset: off as i64,
                     ByteCount: n as i64,
                 };
-                ioctl(
-                    handle(&d),
-                    FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-                    as_bytes(&data),
-                    &mut [],
-                )?;
+                unsafe {
+                    ioctl(
+                        handle(&d),
+                        FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                        std::ptr::from_ref(&data).cast(),
+                        std::mem::size_of_val(&data) as u32,
+                        std::ptr::null_mut(),
+                        0,
+                    )?;
+                }
             }
             Ok(())
         })();
@@ -376,21 +371,5 @@ mod tests {
             2,
             "exactly 4 GiB needs two regions"
         );
-    }
-
-    #[test]
-    fn filetimes_map_like_git_for_windows() {
-        assert_eq!(filetime_to_unix(EPOCH_DIFF_100NS), (0, 0));
-        // 2026-01-01T00:00:00Z plus 1234567 * 100 ns.
-        let ft = EPOCH_DIFF_100NS + 1_767_225_600 * 10_000_000 + 1_234_567;
-        assert_eq!(filetime_to_unix(ft), (1_767_225_600, 123_456_700));
-        // Before 1970: seconds round down, nanoseconds stay positive.
-        assert_eq!(filetime_to_unix(EPOCH_DIFF_100NS - 1), (-1, 999_999_900));
-
-        let s = git_stat(ft, ft + 10_000_000, (5 << 32) + 7);
-        assert_eq!((s.ctime_s, s.ctime_ns), (1_767_225_600, 123_456_700));
-        assert_eq!(s.mtime_s, 1_767_225_601);
-        assert_eq!((s.dev, s.ino, s.uid, s.gid), (0, 0, 0, 0));
-        assert_eq!(s.size, 7, "truncated to 32 bits like git");
     }
 }

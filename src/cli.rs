@@ -2,9 +2,9 @@
 
 use std::ffi::OsString;
 
-use crate::{add, advise, ls, reshare, rm, setup, space};
+use crate::{add, advise, reshare, rm, setup, space};
 
-pub const USAGE: &str = "\
+const USAGE: &str = "\
 sharetree: copy-on-write git worktrees
 
 usage:
@@ -56,16 +56,6 @@ SHARETREE_CONFIG overrides the config path; SHARETREE_NO_PROMPT=1 never asks
 Also usable as `git sharetree <command>` when git-sharetree is on PATH.
 ";
 
-#[cfg(target_os = "linux")]
-fn mount(args: &[OsString]) -> anyhow::Result<i32> {
-    crate::overlay::run_mount(args)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mount(_args: &[OsString]) -> anyhow::Result<i32> {
-    anyhow::bail!("`sharetree mount` remounts overlay worktrees, which exist on Linux only")
-}
-
 pub fn run() -> i32 {
     crate::util::init_umask();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -77,12 +67,17 @@ pub fn run() -> i32 {
     let result = match sub {
         "add" => add::run(rest),
         "rm" | "remove" => rm::run(rest),
-        "ls" | "list" => ls::run(rest),
+        "ls" | "list" => space::run_ls(rest),
         "du" => space::run_du(rest),
         "reshare" => reshare::run(rest),
         "doctor" => advise::run_doctor(rest),
         "setup" => setup::run(rest),
-        "mount" => mount(rest),
+        #[cfg(target_os = "linux")]
+        "mount" => crate::overlay::run_mount(rest),
+        #[cfg(not(target_os = "linux"))]
+        "mount" => Err(anyhow::anyhow!(
+            "`sharetree mount` remounts overlay worktrees, which exist on Linux only"
+        )),
         "__sweep" => rm::sweep_cmd(rest),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");

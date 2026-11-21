@@ -82,6 +82,52 @@ fn sweep_refuses_paths_outside_trash() {
 }
 
 #[test]
+fn ls_keeps_missing_worktrees_and_du_all_skips_them() {
+    let sb = Sandbox::home();
+    let main = sb.repo("main", &[]);
+    let missing = sb.p("missing");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &missing.to_string_lossy(),
+        ],
+    );
+    std::fs::remove_dir_all(&missing).unwrap();
+
+    let out = sb.sharetree(&main, &["list", "--no-size"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("HEAD"), "{text}");
+    assert!(text.contains(&*missing.to_string_lossy()), "{text}");
+
+    let out = sb.sharetree(&main, &["ls"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let missing_row = text
+        .lines()
+        .find(|line| line.contains(&*missing.to_string_lossy()))
+        .unwrap();
+    assert!(missing_row.split_whitespace().take(2).eq(["-", "-"]));
+
+    let out = sb.sharetree(&main, &["du", "--all", "--raw"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows = text.lines();
+    let row = rows.next().unwrap();
+    assert!(
+        rows.next().is_none(),
+        "expected only the main worktree: {text}"
+    );
+    let mut columns = row.splitn(3, '\t');
+    assert!(columns.next().unwrap().parse::<u64>().is_ok(), "{row}");
+    assert_eq!(columns.nth(1), Some(main.to_string_lossy().as_ref()));
+}
+
+#[test]
 fn ls_and_du_report_exclusive_bytes() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);

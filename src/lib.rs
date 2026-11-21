@@ -22,7 +22,6 @@ mod devdrive;
 mod git;
 mod hash;
 mod index;
-mod ls;
 mod reshare;
 mod rm;
 mod setup;
@@ -31,10 +30,7 @@ mod util;
 mod volume;
 mod winclone;
 
-#[cfg(unix)]
-mod reflink;
-#[cfg(windows)]
-#[path = "reflink_windows.rs"]
+#[cfg(any(unix, windows))]
 mod reflink;
 #[cfg(unix)]
 mod warm;

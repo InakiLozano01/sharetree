@@ -12,7 +12,7 @@ use std::process::{Command, Output, Stdio};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_sharetree");
 
-/// Filesystem type name of `p` (`stat -f -c %T`).
+#[cfg(not(target_os = "macos"))]
 pub fn fs_type(p: &Path) -> String {
     let out = Command::new("stat")
         .args(["-f", "-c", "%T"])
@@ -20,6 +20,19 @@ pub fn fs_type(p: &Path) -> String {
         .output()
         .expect("stat");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[cfg(target_os = "macos")]
+pub fn fs_type(p: &Path) -> String {
+    let path = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return std::io::Error::last_os_error().to_string();
+    }
+    let stat = unsafe { stat.assume_init() };
+    unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub struct Sandbox {
@@ -53,7 +66,7 @@ impl Sandbox {
     pub fn reflink() -> Option<Sandbox> {
         let sb = Sandbox::home();
         let t = fs_type(sb.root());
-        if t == "btrfs" || t == "xfs" {
+        if matches!(t.as_str(), "btrfs" | "xfs" | "apfs") {
             Some(sb)
         } else {
             eprintln!(

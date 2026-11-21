@@ -173,6 +173,7 @@ fn reshare_recovers_sharing_after_git_rewrites() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reshare_never_merges_different_content() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);

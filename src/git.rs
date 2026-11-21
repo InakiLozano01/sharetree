@@ -15,6 +15,25 @@ use crate::util::bytes_to_path;
 pub const MODE_REGULAR: u32 = 0o100644;
 pub const MODE_EXEC: u32 = 0o100755;
 
+/// These overrides can make changing the subprocess directory insufficient
+/// to select the intended worktree, or change what our Git queries see.
+pub(crate) fn context_override() -> Option<&'static str> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_GRAFT_FILE",
+        "GIT_SHALLOW_FILE",
+    ]
+    .into_iter()
+    .find(|var| std::env::var_os(var).is_some())
+}
+
 pub fn cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.current_dir(dir);
@@ -146,17 +165,22 @@ pub fn trim_nl(b: &[u8]) -> &[u8] {
     &b[..end]
 }
 
-/// `git config --get`, with "unset" (exit 1) mapped to None.
+/// A Git config value, preserving its whitespace and distinguishing unset
+/// (exit 1) from a present empty value.
 pub fn config_get(dir: &Path, key: &str) -> Result<Option<String>> {
     let out = read_cmd(dir)
-        .args(["config", "--get", key])
+        .args(["config", "-z", "--get", key])
         .stdin(Stdio::null())
         .output()
         .context("failed to run git config")?;
     match out.status.code() {
-        Some(0) => Ok(Some(
-            String::from_utf8_lossy(trim_nl(&out.stdout)).into_owned(),
-        )),
+        Some(0) => {
+            let value = out
+                .stdout
+                .strip_suffix(b"\0")
+                .context("unterminated git config value")?;
+            Ok(Some(String::from_utf8_lossy(value).into_owned()))
+        }
         Some(1) => Ok(None),
         _ => bail!(
             "git config --get {key}: {}",
@@ -373,20 +397,9 @@ pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Whether a hook would run: honours core.hooksPath like git does.
+/// Whether Git can run this hook from the repository.
 pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
-    let dir = match config_get(worktree, "core.hooksPath")? {
-        Some(p) => {
-            let p = expand_tilde(&p);
-            if p.is_absolute() {
-                p
-            } else {
-                worktree.join(p)
-            }
-        }
-        None => common_dir(worktree)?.join("hooks"),
-    };
-    let hook = dir.join(name);
+    let hook = git_path(worktree, &format!("hooks/{name}"))?;
     let Ok(md) = hook.metadata() else {
         return Ok(false);
     };
@@ -397,15 +410,6 @@ pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
     }
     #[cfg(not(unix))]
     Ok(md.is_file())
-}
-
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
 }
 
 #[cfg(test)]

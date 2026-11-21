@@ -18,12 +18,12 @@ enum State {
 }
 
 /// Incremental git object hasher.
-pub struct BlobHasher {
+struct BlobHasher {
     state: State,
 }
 
 impl BlobHasher {
-    pub fn new(fmt: ObjectFormat, len: u64) -> BlobHasher {
+    fn new(fmt: ObjectFormat, len: u64) -> BlobHasher {
         let header = format!("blob {len}\0");
         let mut state = match fmt {
             ObjectFormat::Sha1 => State::Sha1(Box::default()),
@@ -36,7 +36,7 @@ impl BlobHasher {
         BlobHasher { state }
     }
 
-    pub fn update(&mut self, data: &[u8]) {
+    fn update(&mut self, data: &[u8]) {
         match &mut self.state {
             State::Sha1(h) => h.update(data),
             State::Sha256(h) => h.update(data),
@@ -44,7 +44,7 @@ impl BlobHasher {
     }
 
     /// The raw object id, or None when SHA-1 collision detection fired.
-    pub fn finish(self) -> Option<Vec<u8>> {
+    fn finish(self) -> Option<Vec<u8>> {
         match self.state {
             State::Sha1(h) => {
                 let r = h.try_finalize();
@@ -61,7 +61,7 @@ impl BlobHasher {
 pub fn blob_oid(f: &mut File, len: u64, fmt: ObjectFormat) -> io::Result<Option<Vec<u8>>> {
     advise_sequential(f, len);
     let mut h = BlobHasher::new(fmt, len);
-    let mut buf = vec![0u8; BUF.min(len as usize + 1).max(1)];
+    let mut buf = vec![0u8; len.saturating_add(1).min(BUF as u64) as usize];
     let mut left = len;
     loop {
         let n = match f.read(&mut buf) {

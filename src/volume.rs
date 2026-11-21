@@ -120,14 +120,14 @@ pub struct MountEntry {
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space, etc.).
-fn unescape(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
+fn unescape(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'\\'
             && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+            && (b'0'..=b'3').contains(&b[i + 1])
+            && b[i + 2..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
         {
             let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
             out.push(v);
@@ -140,11 +140,11 @@ fn unescape(s: &str) -> Vec<u8> {
     out
 }
 
-pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
+fn parse_mountinfo_bytes(text: &[u8]) -> Vec<MountEntry> {
     let mut v = Vec::new();
-    for line in text.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        let Some(sep) = f.iter().position(|x| *x == "-") else {
+    for line in text.split(|b| *b == b'\n') {
+        let f: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+        let Some(sep) = f.iter().position(|x| *x == b"-") else {
             continue;
         };
         if sep < 6 || f.len() < sep + 3 {
@@ -153,7 +153,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
         v.push(MountEntry {
             root: String::from_utf8_lossy(&unescape(f[3])).into_owned(),
             mountpoint: crate::util::bytes_to_path(&unescape(f[4])),
-            fstype: f[sep + 1].to_string(),
+            fstype: String::from_utf8_lossy(f[sep + 1]).into_owned(),
             source: String::from_utf8_lossy(&unescape(f[sep + 2])).into_owned(),
         });
     }
@@ -175,6 +175,9 @@ pub fn systemd_quote(s: &str) -> String {
             }
             '%' => out.push_str("%%"),
             '$' => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             _ => out.push(c),
         }
     }
@@ -186,7 +189,7 @@ pub fn unit_name(volume: &str) -> String {
     let safe: String = volume
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
                 c
             } else {
                 '_'
@@ -327,29 +330,42 @@ pub fn mount_method_desc(m: MountMethod) -> &'static str {
 /// Volume state on any platform. A Dev Drive counts as mounted when its
 /// drive root exists.
 pub fn current_state(v: &Volume) -> State {
+    try_current_state(v).unwrap_or(State::Detached)
+}
+
+pub fn try_current_state(v: &Volume) -> anyhow::Result<State> {
     if v.kind == VolumeKind::Devdrive {
-        return match &v.mountpoint {
+        if !v.image.try_exists()? {
+            return Ok(State::ImageMissing);
+        }
+        return Ok(match &v.mountpoint {
             Some(m) if m.is_dir() => State::Mounted {
                 mountpoint: m.clone(),
                 device: None,
             },
-            _ if v.image.symlink_metadata().is_err() => State::ImageMissing,
             _ => State::Detached,
-        };
+        });
     }
     #[cfg(target_os = "linux")]
     {
-        linux::state(v)
+        linux::observe_state(v)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        State::Detached
+        Ok(State::Detached)
     }
 }
 
 /// Mount the volume if needed (Linux: udisks), returning its mountpoint.
 pub fn mount_any(v: &Volume, quiet: bool) -> anyhow::Result<PathBuf> {
-    if let State::Mounted { mountpoint, .. } = current_state(v) {
+    if v.kind != VolumeKind::Devdrive && !v.image.try_exists()? {
+        anyhow::bail!(
+            "the image of sharetree volume '{}' is missing: {}",
+            v.name,
+            v.image.display()
+        );
+    }
+    if let State::Mounted { mountpoint, .. } = try_current_state(v)? {
         return Ok(mountpoint);
     }
     if v.kind == VolumeKind::Devdrive {
@@ -392,66 +408,97 @@ pub use self::linux::*;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::OsStr;
     use std::fs;
+    use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context, Result};
 
-    use super::{parse_mountinfo, MountEntry, State};
+    use super::{parse_mountinfo_bytes, MountEntry, State};
     use crate::config::{MountMethod, Volume, VolumeKind};
     use crate::util::canon;
 
-    fn backing_file(loopdev: &str) -> Option<PathBuf> {
-        let name = loopdev.strip_prefix("/dev/")?;
-        let s = fs::read_to_string(format!("/sys/block/{name}/loop/backing_file")).ok()?;
-        let s = s.trim_end_matches('\n');
-        let s = s.strip_suffix(" (deleted)").unwrap_or(s);
-        Some(PathBuf::from(s))
-    }
-
     /// Loop devices whose backing file is `image`.
-    pub fn loop_devices_for(image: &Path) -> Vec<String> {
+    fn loop_devices_for(image: &Path, image_exists: bool) -> Result<Vec<String>> {
         let want = canon(image);
-        let mut v: Vec<String> = fs::read_dir("/sys/block")
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.starts_with("loop"))
-            .map(|n| format!("/dev/{n}"))
-            .filter(|d| backing_file(d).is_some_and(|b| b == want))
-            .collect();
-        v.sort();
-        v
+        let mut devices = Vec::new();
+        for entry in fs::read_dir("/sys/block").context("reading /sys/block")? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !name.starts_with("loop") {
+                continue;
+            }
+            let path = entry.path().join("loop/backing_file");
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e)
+                    if e.kind() == ErrorKind::NotFound
+                        || matches!(e.raw_os_error(), Some(libc::ENXIO | libc::ENODEV)) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            if matches_backing_file(&bytes, &want, image_exists) {
+                devices.push(format!("/dev/{name}"));
+            }
+        }
+        devices.sort();
+        Ok(devices)
     }
 
-    pub fn mounts() -> Vec<MountEntry> {
-        fs::read_to_string("/proc/self/mountinfo")
-            .map(|t| parse_mountinfo(&t))
-            .unwrap_or_default()
+    fn matches_backing_file(bytes: &[u8], image: &Path, image_exists: bool) -> bool {
+        let raw = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let backing = crate::util::bytes_to_path(raw);
+        backing == image
+            || (!image_exists
+                && raw
+                    .strip_suffix(b" (deleted)")
+                    .is_some_and(|p| crate::util::bytes_to_path(p) == image && !backing.exists()))
     }
 
-    pub fn state(v: &Volume) -> State {
+    pub fn mounts() -> Result<Vec<MountEntry>> {
+        let mountinfo = fs::read("/proc/self/mountinfo").context("reading mountinfo")?;
+        Ok(parse_mountinfo_bytes(&mountinfo))
+    }
+
+    pub(super) fn observe_state(v: &Volume) -> Result<State> {
         if v.mount == MountMethod::Devdrive {
-            return State::Detached;
+            return Ok(State::Detached);
         }
-        if v.image.symlink_metadata().is_err() {
-            return State::ImageMissing;
+        let image_exists = v
+            .image
+            .try_exists()
+            .with_context(|| format!("reading {}", v.image.display()))?;
+        let devices = loop_devices_for(&v.image, image_exists)?;
+        if devices.is_empty() {
+            return Ok(if image_exists {
+                State::Detached
+            } else {
+                State::ImageMissing
+            });
         }
-        let devs = loop_devices_for(&v.image);
-        let all = mounts();
+        Ok(observed_attachment(devices, &mounts()?))
+    }
+
+    fn observed_attachment(devices: Vec<String>, mounts: &[MountEntry]) -> State {
         // Prefer the filesystem root (a Btrfs subvolume mount has root != /).
-        let mut hits: Vec<&MountEntry> = all.iter().filter(|m| devs.contains(&m.source)).collect();
-        hits.sort_by_key(|m| m.root != "/");
-        if let Some(m) = hits.first() {
+        if let Some(m) = mounts
+            .iter()
+            .filter(|m| devices.contains(&m.source))
+            .min_by_key(|m| m.root != "/")
+        {
             return State::Mounted {
                 mountpoint: m.mountpoint.clone(),
                 device: Some(m.source.clone()),
             };
         }
-        match devs.into_iter().next() {
+        match devices.into_iter().next() {
             Some(device) => State::Attached { device },
             None => State::Detached,
         }
@@ -497,7 +544,7 @@ mod linux {
         Ok(())
     }
 
-    fn udisksctl(args: &[&str]) -> Result<String> {
+    fn udisksctl(args: &[&OsStr]) -> Result<String> {
         let out = Command::new("udisksctl")
             .args(args)
             .arg("--no-user-interaction")
@@ -510,37 +557,62 @@ mod linux {
             String::from_utf8_lossy(&out.stderr)
         );
         if !out.status.success() {
+            let args = args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>();
             bail!("udisksctl {}: {}", args.join(" "), text.trim());
         }
         Ok(text)
     }
 
-    /// "Mapped file /x/volume.img as /dev/loop3."
-    pub fn parse_loop_setup(out: &str) -> Option<String> {
-        let i = out.find(" as /dev/")?;
-        let dev: String = out[i + 4..]
-            .chars()
-            .take_while(|c| !c.is_whitespace())
-            .collect();
-        Some(dev.trim_end_matches('.').to_string())
+    fn udisks_device(action: &str, device: &str) -> Result<String> {
+        udisksctl(&[action.as_ref(), "-b".as_ref(), device.as_ref()])
     }
 
-    fn wait_mounted(v: &Volume, for_: Duration) -> Option<PathBuf> {
-        let t = Instant::now();
+    fn wait_for_state(
+        v: &Volume,
+        duration: Duration,
+        ready: impl Fn(&State) -> bool,
+    ) -> Result<Option<State>> {
+        let start = Instant::now();
         loop {
-            if let State::Mounted { mountpoint, .. } = state(v) {
-                return Some(mountpoint);
+            let state = observe_state(v)?;
+            if ready(&state) {
+                return Ok(Some(state));
             }
-            if t.elapsed() >= for_ {
-                return None;
+            if start.elapsed() >= duration {
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
+    fn wait_mounted(v: &Volume, duration: Duration) -> Result<Option<PathBuf>> {
+        Ok(
+            wait_for_state(v, duration, |state| state.mountpoint().is_some())?
+                .and_then(|state| state.mountpoint().map(Path::to_path_buf)),
+        )
+    }
+
     /// Attach and mount the volume if needed; returns the mountpoint.
     pub fn ensure_mounted(v: &Volume, quiet: bool) -> Result<PathBuf> {
-        let dev = match state(v) {
+        let lockpath = crate::config::config_path()
+            .context("cannot locate a config directory (set HOME or XDG_CONFIG_HOME)")?
+            .with_extension("volume-attach.lock");
+        if let Some(dir) = lockpath.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lockpath)
+            .with_context(|| format!("opening {}", lockpath.display()))?;
+        lock.lock()
+            .with_context(|| format!("locking {}", lockpath.display()))?;
+        let dev = match observe_state(v)? {
             State::Mounted { mountpoint, .. } => return Ok(mountpoint),
             State::ImageMissing => bail!(
                 "the image of sharetree volume '{}' is missing: {}",
@@ -569,29 +641,42 @@ mod linux {
                         v.name
                     )
                 })?;
-                let image = v.image.to_string_lossy().into_owned();
-                let out = udisksctl(&["loop-setup", "--no-partition-scan", "-f", &image])?;
-                let dev = parse_loop_setup(&out)
-                    .or_else(|| loop_devices_for(&v.image).into_iter().next())
-                    .with_context(|| format!("udisksctl loop-setup said: {}", out.trim()))?;
-                if !quiet {
-                    eprintln!("sharetree: attached {} as {dev}", v.image.display());
+                let command = udisksctl(&[
+                    "loop-setup".as_ref(),
+                    "--no-partition-scan".as_ref(),
+                    "-f".as_ref(),
+                    v.image.as_os_str(),
+                ]);
+                match wait_for_state(v, Duration::from_secs(2), |state| {
+                    matches!(state, State::Mounted { .. } | State::Attached { .. })
+                })? {
+                    Some(State::Mounted { mountpoint, .. }) => return Ok(mountpoint),
+                    Some(State::Attached { device }) => {
+                        if !quiet {
+                            eprintln!("sharetree: attached {} as {device}", v.image.display());
+                        }
+                        device
+                    }
+                    _ => bail!(
+                        "udisksctl loop-setup did not attach {}: {}",
+                        v.image.display(),
+                        command?.trim()
+                    ),
                 }
-                dev
             }
         };
         // A desktop automounter (udiskie, GNOME, KDE) may mount it for us.
-        if let Some(mp) = wait_mounted(v, Duration::from_millis(1500)) {
+        if let Some(mp) = wait_mounted(v, Duration::from_millis(1500))? {
             return Ok(mp);
         }
-        if let Err(e) = udisksctl(&["mount", "-b", &dev]) {
+        if let Err(e) = udisks_device("mount", &dev) {
             // Lost a race with an automounter?
-            if let Some(mp) = wait_mounted(v, Duration::from_secs(2)) {
+            if let Some(mp) = wait_mounted(v, Duration::from_secs(2))? {
                 return Ok(mp);
             }
             return Err(e);
         }
-        let mp = wait_mounted(v, Duration::from_secs(3))
+        let mp = wait_mounted(v, Duration::from_secs(3))?
             .with_context(|| format!("{dev} was mounted but does not appear in mountinfo"))?;
         if !quiet {
             eprintln!("sharetree: mounted volume '{}' at {}", v.name, mp.display());
@@ -599,10 +684,15 @@ mod linux {
         Ok(mp)
     }
 
-    /// Unmount and detach (udisks). Returns what happened.
+    /// Unmount and detach, checking that each observed transition made progress.
     pub fn unmount(v: &Volume) -> Result<()> {
+        let mut state = observe_state(v)?;
+        let mut seen = Vec::new();
         loop {
-            match state(v) {
+            if seen.contains(&state) {
+                bail!("volume '{}' returned to {state:?} while detaching", v.name);
+            }
+            let (action, device) = match &state {
                 State::Mounted { device, mountpoint } => {
                     let Some(dev) = device else {
                         bail!("{} is mounted from an unknown device", mountpoint.display())
@@ -614,13 +704,19 @@ mod linux {
                             mountpoint.display()
                         );
                     }
-                    udisksctl(&["unmount", "-b", &dev])?;
+                    ("unmount", dev)
                 }
-                State::Attached { device } => {
-                    udisksctl(&["loop-delete", "-b", &device])?;
-                }
+                State::Attached { device } => ("loop-delete", device),
                 State::Detached | State::ImageMissing => return Ok(()),
-            }
+            };
+            let command = udisks_device(action, device);
+            let Some(next) = wait_for_state(v, Duration::from_secs(2), |next| *next != state)?
+            else {
+                command.with_context(|| format!("detaching volume '{}' from {device}", v.name))?;
+                bail!("udisksctl {action} did not change the state of {device}");
+            };
+            seen.push(state);
+            state = next;
         }
     }
 
@@ -757,12 +853,42 @@ mod linux {
         use super::*;
 
         #[test]
-        fn loop_setup_output() {
-            assert_eq!(
-                parse_loop_setup("Mapped file /home/u/v.img as /dev/loop3.\n").as_deref(),
-                Some("/dev/loop3")
+        fn finds_a_live_loop_with_a_deleted_backing_path() {
+            let image = Path::new("/run/sharetree-test/image");
+            let kernel = b"/run/sharetree-test/image (deleted)\n";
+            assert!(matches_backing_file(kernel, image, false));
+            assert!(
+                !matches_backing_file(kernel, image, true),
+                "a new image is a different file"
             );
-            assert_eq!(parse_loop_setup("Error"), None);
+            assert!(matches_backing_file(
+                kernel,
+                &image.with_file_name("image (deleted)"),
+                true
+            ));
+        }
+
+        #[test]
+        fn observes_mounted_and_attached_loop_devices() {
+            let devices = vec!["/dev/loop3".into()];
+            let mounts = parse_mountinfo_bytes(
+                b"\
+1 0 7:3 /sub /mnt/sub rw - btrfs /dev/loop3 rw\n\
+2 0 7:3 / /mnt/root rw - btrfs /dev/loop3 rw\n",
+            );
+            assert_eq!(
+                observed_attachment(devices.clone(), &mounts),
+                State::Mounted {
+                    mountpoint: "/mnt/root".into(),
+                    device: Some("/dev/loop3".into())
+                }
+            );
+            assert_eq!(
+                observed_attachment(devices, &[]),
+                State::Attached {
+                    device: "/dev/loop3".into()
+                }
+            );
         }
     }
 }
@@ -770,6 +896,22 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drive_letter_cannot_replace_a_missing_devdrive_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Volume {
+            name: "devdrive".into(),
+            kind: VolumeKind::Devdrive,
+            image: dir.path().join("missing.vhdx"),
+            label: "sharetree".into(),
+            size: 0,
+            mount: MountMethod::Devdrive,
+            mountpoint: Some(dir.path().to_owned()),
+            unit: None,
+        };
+        assert_eq!(try_current_state(&v).unwrap(), State::ImageMissing);
+    }
 
     fn vol(kind: VolumeKind, image: &str) -> Volume {
         Volume {
@@ -791,13 +933,21 @@ mod tests {
 37 35 98:0 /sub /mnt/sub rw - btrfs /dev/loop3 rw\n\
 garbage line\n\
 40 1 0:5 / /proc rw,nosuid master:2 - proc proc rw\n";
-        let m = parse_mountinfo(text);
+        let m = parse_mountinfo_bytes(text.as_bytes());
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].mountpoint, PathBuf::from("/run/media/u/cow tree"));
         assert_eq!(m[0].fstype, "btrfs");
         assert_eq!(m[0].source, "/dev/loop3");
         assert_eq!(m[1].root, "/sub");
         assert_eq!(m[2].fstype, "proc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountinfo_preserves_non_utf8_mountpoints() {
+        use std::os::unix::ffi::OsStrExt;
+        let m = parse_mountinfo_bytes(b"1 0 7:0 / /mnt/\xff\\040tree rw - xfs /dev/loop0 rw\n");
+        assert_eq!(m[0].mountpoint.as_os_str().as_bytes(), b"/mnt/\xff tree");
     }
 
     #[test]
@@ -859,7 +1009,9 @@ garbage line\n\
         assert!(u.contains("Restart=on-failure\n"));
         assert!(u.contains("WantedBy=default.target\n"));
         assert_eq!(systemd_quote("a$b%c\"d"), "\"a$$b%%c\\\"d\"");
+        assert_eq!(systemd_quote("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
         assert_eq!(unit_name("my vol"), "sharetree-volume-my_vol.service");
+        assert_ne!(unit_name("a.b"), unit_name("a_b"));
     }
 
     #[test]

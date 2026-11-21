@@ -117,7 +117,11 @@ mod imp {
                 !x.is_empty()
                     && x.len() == y.len()
                     && x.iter().zip(&y).all(|(p, q)| {
-                        p.physical == q.physical && p.length == q.length && p.shared()
+                        p.logical == q.logical
+                            && p.physical == q.physical
+                            && p.length == q.length
+                            && p.shared()
+                            && q.shared()
                     })
             }
             _ => false,
@@ -134,7 +138,16 @@ mod imp {
         let tcanon = util::canon(&target);
         let dev = fs::metadata(&target)?.dev();
         let donors: Vec<PathBuf> = match &a.from {
-            Some(p) => vec![git::toplevel(&util::absolutize(p, &cwd))?],
+            Some(p) => {
+                let donor = git::toplevel(&util::absolutize(p, &cwd))?;
+                if util::canon(&donor) == tcanon {
+                    bail!("the donor and target are the same worktree");
+                }
+                if fs::metadata(&donor)?.dev() != dev {
+                    bail!("the donor and target must be on the same filesystem");
+                }
+                vec![donor]
+            }
             None => git::list_worktrees(&target)?
                 .into_iter()
                 .filter(|w| !w.bare && !w.prunable && util::canon(&w.path) != tcanon)
@@ -192,8 +205,11 @@ mod imp {
                         continue;
                     };
                     if !sm.is_file()
+                        || !before.is_file()
                         || sm.len() != *len
-                        || (sm.dev(), sm.ino()) == (before.dev(), before.ino())
+                        || before.len() != *len
+                        || sm.dev() != before.dev()
+                        || sm.ino() == before.ino()
                     {
                         failed.fetch_add(1, Ordering::Relaxed);
                         continue;

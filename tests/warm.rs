@@ -145,3 +145,40 @@ fn warm_skips_other_worktrees_nested_in_the_donor() {
     assert!(!main.join(".worktrees/b/.worktrees").exists(), "{err}");
     assert!(main.join(".worktrees/b/node_modules/pkg/index.js").exists());
 }
+
+#[test]
+fn warm_preserves_a_tracked_symlink_to_an_external_directory() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join(".gitignore"), b"nested/cache/\n");
+    write(&main.join("nested/tracked"), b"tracked\n");
+    sb.commit_all(&main, "add ignored cache policy");
+    write(&main.join("nested/cache/asset"), &bytes(14, 32_000));
+
+    let outside = sb.p("outside");
+    fs::create_dir(&outside).unwrap();
+    let editor = sb.p("editor");
+    sb.git(
+        &main,
+        &["worktree", "add", "--detach", editor.to_str().unwrap()],
+    );
+    fs::remove_dir_all(editor.join("nested")).unwrap();
+    std::os::unix::fs::symlink(&outside, editor.join("nested")).unwrap();
+    let target = sb.commit_all(&editor, "replace directory with link");
+
+    let dest = sb.p("warm");
+    sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            main.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &target,
+        ],
+    );
+    assert_eq!(fs::read_link(dest.join("nested")).unwrap(), outside);
+    assert!(!outside.join("cache").exists());
+}

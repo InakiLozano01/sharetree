@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Compare stock `git worktree add` with `sharetree add` on an existing checkout.
-#
-#   bench/bench.sh <repo-main-worktree> [repeats]
-#
-# For each repeat (order alternates) it measures, per tool:
-#   - wall time of the add
-#   - Exclusive bytes of the new worktree (`btrfs filesystem du -s`, .git excluded)
-#   - wall time of the first `git status`
-# Worktrees are created next to the repo as bench-<tool>-<n> and removed again.
-# Page cache is warm (no root needed); run on an otherwise idle Btrfs volume.
-# Before each add: sync, then sleep $SETTLE seconds (default 2).
 set -euo pipefail
 
 repo=$(cd "$1" && pwd -P)
@@ -37,7 +26,6 @@ exclusive() {
 
 run_one() {
   local tool=$1 n=$2 t0 t1 t2 t3 add_ms st_ms excl
-  # Let Btrfs finish the previous run's deletes so they do not land on this one.
   sync; sleep "${SETTLE:-2}"
   t0=$(now)
   if [ "$tool" = git ]; then

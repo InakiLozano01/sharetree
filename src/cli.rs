@@ -1,5 +1,3 @@
-//! Command-line dispatch.
-
 use std::ffi::OsString;
 
 use crate::{add, advise, reshare, rm, setup, space};

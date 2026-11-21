@@ -1,12 +1,3 @@
-//! `sharetree reshare`: recover sharing that git rewrites destroyed (design
-//! §8.5). Linux only: FIDEDUPERANGE makes the kernel compare both files byte
-//! for byte under its own locks and share extents only if they are equal, so
-//! nothing here can change file content. Inodes, mtimes and ctimes stay
-//! put, so the worktree's index stays valid and `git status` stays fast.
-//!
-//! Idea from huntharo/git `worktree-reflink.adoc` (ideas only, GPL code not
-//! used) and git-twig `adopt --dedupe`.
-
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -88,7 +79,6 @@ mod imp {
     use crate::linux::{self, DedupeOutcome};
     use crate::util::{self, bytes_to_path, human};
 
-    /// Stage-0 regular files whose working copy is stat-clean.
     fn clean_files(wt: &Path) -> Result<Vec<(Vec<u8>, String)>> {
         let entries = git::ls_files_stage(wt)?;
         let dirty: HashSet<Vec<u8>> =
@@ -159,7 +149,6 @@ mod imp {
             bail!("no other worktree on the same filesystem to share with");
         }
 
-        // Donor files by blob id.
         let mut by_oid: HashMap<String, PathBuf> = HashMap::new();
         for d in &donors {
             if util::canon(d) == tcanon {

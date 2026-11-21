@@ -1,8 +1,3 @@
-//! "Use the volume?" when the destination cannot reflink and the user has
-//! not chosen: plain git plus a hint without a terminal; a prompt whose
-//! "always"/"never" answers are saved when there is one. The volume here is
-//! only configured (its image does not exist), so nothing is mounted.
-
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -50,11 +45,9 @@ fn no_terminal_means_plain_git_and_a_hint() {
     assert!(wt.is_dir() && !wt.is_symlink(), "a plain worktree");
     assert_eq!(config(&sb), before, "nothing is saved without an answer");
 
-    // Once chosen ("never"), there is no hint any more.
     sb.sharetree_ok(&main, &["setup", "auto", "off", "--repo"]);
     let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("wt2").to_string_lossy()]);
     assert!(!err.contains("hint:"), "{err}");
-    // And `ask` makes it undecided again.
     sb.sharetree_ok(&main, &["setup", "auto", "ask", "--repo"]);
     let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("wt3").to_string_lossy()]);
     assert!(err.contains("no terminal to ask on"), "{err}");
@@ -73,8 +66,6 @@ fn no_prompt_env_suppresses_the_question() {
     assert!(!config(&sb).contains("auto_volume"));
 }
 
-/// Run `sharetree add --detach <root>/wt` inside a pseudo-terminal (util-linux
-/// `script`), typing `input`. None (skip) when `script` is unavailable.
 fn in_pty(sb: &Sandbox, dir: &Path, env: &[(&str, &str)], input: &str) -> Option<String> {
     if Command::new("script").arg("--version").output().is_err() {
         eprintln!("SKIP: util-linux `script` is not installed");
@@ -85,7 +76,6 @@ fn in_pty(sb: &Sandbox, dir: &Path, env: &[(&str, &str)], input: &str) -> Option
         BIN,
         sb.p("wt").to_string_lossy().replace(' ', "\\ ")
     );
-    // `script` gets the sandbox environment sharetree_cmd would use.
     let template = sb.sharetree_cmd(dir);
     let mut s = Command::new("script");
     s.current_dir(dir)
@@ -123,7 +113,6 @@ fn terminal_answers_never_and_always_are_saved() {
     configure_volume(&sb, "");
     let main = sb.repo("main", &[]);
 
-    // "n": plain this time, nothing saved.
     let Some(out) = in_pty(&sb, &main, &[], "n\n") else {
         return;
     };
@@ -132,7 +121,6 @@ fn terminal_answers_never_and_always_are_saved() {
     assert!(!config(&sb).contains("auto_volume"), "{}", config(&sb));
     sb.sharetree_ok(&main, &["rm", "--sync", &sb.p("wt").to_string_lossy()]);
 
-    // An unknown answer asks again; "v" (never) is saved for this repo.
     let out = in_pty(&sb, &main, &[], "maybe\nv\n").unwrap();
     assert!(out.contains("please answer"), "{out}");
     assert!(out.contains("saved auto_volume = false"), "{out}");
@@ -144,13 +132,10 @@ fn terminal_answers_never_and_always_are_saved() {
     );
     sb.sharetree_ok(&main, &["rm", "--sync", &sb.p("wt").to_string_lossy()]);
 
-    // Decided: no question any more, even on a terminal.
     let out = in_pty(&sb, &main, &[], "").unwrap();
     assert!(!out.contains("Use volume"), "{out}");
     sb.sharetree_ok(&main, &["rm", "--sync", &sb.p("wt").to_string_lossy()]);
 
-    // "a" (always) is saved, then the add needs the volume, whose image is
-    // missing here: it fails loudly instead of writing a full checkout.
     sb.sharetree_ok(&main, &["setup", "auto", "ask", "--repo"]);
     let out = in_pty(&sb, &main, &[], "a\n").unwrap();
     assert!(out.contains("saved auto_volume = true"), "{out}");

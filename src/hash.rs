@@ -1,8 +1,3 @@
-//! In-process git blob hashing: `blob <len>\0<bytes>` with the repository's
-//! object format. SHA-1 uses collision detection (sha1-checked, a port of
-//! the sha1dc library git itself is built with), so a SHAttered-style
-//! colliding file is rejected exactly as `git hash-object` would reject it.
-
 use std::fs::File;
 use std::io::{self, Read};
 
@@ -17,7 +12,6 @@ enum State {
     Sha256(sha2::Sha256),
 }
 
-/// Incremental git object hasher.
 struct BlobHasher {
     state: State,
 }
@@ -43,7 +37,6 @@ impl BlobHasher {
         }
     }
 
-    /// The raw object id, or None when SHA-1 collision detection fired.
     fn finish(self) -> Option<Vec<u8>> {
         match self.state {
             State::Sha1(h) => {
@@ -55,9 +48,6 @@ impl BlobHasher {
     }
 }
 
-/// Hash exactly `len` bytes of `f` (from its current offset) as a blob.
-/// Returns None when the file holds fewer or more bytes than `len`, or
-/// collision detection fired.
 pub fn blob_oid(f: &mut File, len: u64, fmt: ObjectFormat) -> io::Result<Option<Vec<u8>>> {
     advise_sequential(f, len);
     let mut h = BlobHasher::new(fmt, len);
@@ -73,7 +63,7 @@ pub fn blob_oid(f: &mut File, len: u64, fmt: ObjectFormat) -> io::Result<Option<
             break;
         }
         if n as u64 > left {
-            return Ok(None); // longer than expected
+            return Ok(None);
         }
         h.update(&buf[..n]);
         left -= n as u64;
@@ -84,14 +74,9 @@ pub fn blob_oid(f: &mut File, len: u64, fmt: ObjectFormat) -> io::Result<Option<
     Ok(h.finish())
 }
 
-/// Tell the kernel the file is read front to back, so it reads ahead in
-/// large chunks (a fresh clone has an empty page cache).
 #[cfg(target_os = "linux")]
 fn advise_sequential(f: &File, len: u64) {
     use std::os::fd::AsRawFd;
-    // SEQUENTIAL doubles the readahead window. WILLNEED was measured too:
-    // it queued whole files from every hasher at once and was slower.
-    // SAFETY: an advisory syscall on an open descriptor.
     unsafe {
         libc::posix_fadvise(f.as_raw_fd(), 0, len as i64, libc::POSIX_FADV_SEQUENTIAL);
     }
@@ -122,7 +107,6 @@ mod tests {
 
     #[test]
     fn matches_git_hash_object() {
-        // `printf 'hello\n' | git hash-object --stdin` (and the SHA-256 variant).
         assert_eq!(
             oid_of(b"hello\n", ObjectFormat::Sha1).unwrap(),
             "ce013625030ba8dba906f756967f9e9ca394464a"
@@ -150,15 +134,9 @@ mod tests {
 
     #[test]
     fn shattered_collision_is_rejected() {
-        // The first 320 bytes of the SHAttered PDFs (shattered.io): the two
-        // prefixes differ yet have the same plain SHA-1. sha1dc flags any
-        // message containing such a near-collision block.
         let prefix = include_bytes!("../tests/data/shattered-1-prefix.bin");
         let r = sha1_checked::Sha1::try_digest(prefix);
         assert!(r.has_collision(), "sha1dc must flag the SHAttered block");
-        // A git blob prepends "blob <len>\0", which shifts the blocks, so
-        // the published PDFs do not collide as blobs; feed the hasher state
-        // the raw blocks to prove the detector is what `finish` consults.
         let mut h = BlobHasher {
             state: State::Sha1(Box::default()),
         };

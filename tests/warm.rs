@@ -1,5 +1,3 @@
-//! `add --warm`: ignored build caches, reflink only, with policy and vetoes.
-
 #![cfg(unix)]
 
 mod common;
@@ -58,7 +56,6 @@ fn cache_repo(sb: &Sandbox) -> std::path::PathBuf {
     )
     .unwrap();
     set_old_mtime(&main.join("target/debug/app"));
-    // A python venv nested deeper inside an otherwise cloned cache.
     write(&main.join("target/py/pyvenv.cfg"), b"x");
     write(&main.join("debug.log"), b"log");
     main
@@ -78,7 +75,6 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         fs::read(cow.join("node_modules/pkg/index.js")).unwrap(),
         bytes(1, 20_000)
     );
-    // Absolute links into the donor point into the new worktree.
     assert_eq!(
         fs::read_link(cow.join("node_modules/.bin/abs")).unwrap(),
         cow.join("node_modules/pkg/index.js")
@@ -91,14 +87,12 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         fs::read_link(cow.join("node_modules/.bin/outside")).unwrap(),
         Path::new("/usr/bin/env")
     );
-    // mtime and mode kept (build tools compare them).
     let a = fs::metadata(main.join("target/debug/app")).unwrap();
     let b = fs::metadata(cow.join("target/debug/app")).unwrap();
     assert_eq!(
         (a.mtime(), a.mode() & 0o7777),
         (b.mtime(), b.mode() & 0o7777)
     );
-    // Vetoed.
     for p in [".venv", "build", ".env", ".env.local", "target/py"] {
         assert!(!cow.join(p).exists(), "{p} must not be cloned");
     }
@@ -106,9 +100,7 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         err.contains("pyvenv.cfg") && err.contains("CMakeCache.txt") && err.contains(".env"),
         "{err}"
     );
-    // Tracked content still equals a stock worktree's, and is clean.
     assert!(sb.git(&cow, &["status", "--porcelain"]).is_empty());
-    // Write isolation for caches too.
     fs::write(cow.join("node_modules/pkg/index.js"), b"edited").unwrap();
     assert_eq!(
         fs::read(main.join("node_modules/pkg/index.js")).unwrap(),

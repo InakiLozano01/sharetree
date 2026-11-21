@@ -1,8 +1,3 @@
-//! `sharetree add --overlay`: fuse-overlayfs worktrees over a base checkout.
-//! The end-to-end test runs only where fuse-overlayfs is installed and can
-//! mount without root; elsewhere it prints SKIP. It always unmounts and
-//! removes what it created.
-
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -12,8 +7,6 @@ use std::process::{Command, Stdio};
 
 use common::*;
 
-// Exercise the configured lifecycle with real Git registrations, without a
-// FUSE device. Unmounted legacy overlays keep their .git file in the upper.
 #[test]
 fn removes_legacy_overlay_with_custom_lock_and_protects_its_base() {
     let sb = Sandbox::home();
@@ -127,7 +120,6 @@ fn missing_fuse_overlayfs_fails_clearly() {
     );
 }
 
-/// Unmount anything left mounted under the sandbox.
 struct Unmount(Vec<std::path::PathBuf>);
 
 impl Drop for Unmount {
@@ -165,8 +157,6 @@ fn overlay_worktree_end_to_end() {
         eprintln!("SKIP overlay_worktree_end_to_end: no /dev/fuse");
         return;
     }
-    // /tmp is tmpfs here: no reflinks, the case the overlay is for. Data
-    // (bases, upper/work) goes to the sandbox's XDG_DATA_HOME on the same fs.
     let Some(sb) = Sandbox::tmpfs() else { return };
     let main = sb.repo("main", &[]);
     sb.git(
@@ -204,7 +194,6 @@ fn overlay_worktree_end_to_end() {
     assert!(list.contains("locked sharetree overlay"), "{list}");
     assert!(list.contains("locked sharetree overlay base"), "{list}");
 
-    // A second overlay shares the base; edits stay private.
     let ovl2 = sb.p("ovl2");
     let out = sb
         .sharetree_cmd(&main)
@@ -222,14 +211,12 @@ fn overlay_worktree_end_to_end() {
     write(&ovl.join("big.bin"), b"changed\n");
     assert_ne!(std::fs::read(ovl2.join("big.bin")).unwrap(), b"changed\n");
 
-    // Unmount and remount (what the login unit does).
     sb.sharetree_ok(&main, &["mount", "--unmount", "--all"]);
     assert!(!mounted(&ovl) && !ovl.join(".git").exists());
     sb.sharetree_ok(&main, &["mount", "--all"]);
     assert!(mounted(&ovl));
     assert_eq!(std::fs::read(ovl.join("big.bin")).unwrap(), b"changed\n");
 
-    // rm refuses a dirty overlay, then cleans up everything with -f.
     let out = sb.sharetree(&main, &["rm", &ovl.to_string_lossy()]);
     assert!(!out.status.success());
     let mut busy = Command::new("sleep")

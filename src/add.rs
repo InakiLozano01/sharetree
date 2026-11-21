@@ -1,19 +1,3 @@
-//! `sharetree add`: the tracked-file layer (design §8.3).
-//!
-//! 1. Preflight: anything unusual delegates to plain `git worktree add`.
-//! 2. Probe a real reflink next to the destination.
-//! 3. `git worktree add --no-checkout`, overlapped with donor analysis.
-//! 4. Plan: target regular files a clean donor file holds byte-for-byte,
-//!    without checkout conversions, inside the sparse cone.
-//! 5. Clone in parallel; re-`fstat` the donor after each clone.
-//! 6. Hash every clone in-process (sha1dc / SHA-256); drop mismatches.
-//! 7. Write a v2 index of verified entries with their real lstat data.
-//! 8. `git reset --hard --no-recurse-submodules` writes the rest.
-//! 9. Run post-checkout like `git worktree add` would.
-//!
-//! Flow and index trick from josharian/git-cow-worktree (MIT); donor scoring
-//! by matching entries from leostera/git-twig (MIT). See THIRD_PARTY_NOTICES.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -25,9 +9,6 @@ use crate::config::{Config, Volume};
 use crate::util::Trace;
 use crate::{git, util, volume};
 
-/// Files at or below btrfs's default `max_inline` (2048 bytes) live in
-/// metadata and can never share an extent; above it every file costs at
-/// least one 4 KiB block, which a reflink saves.
 pub const DEFAULT_MIN_SIZE: u64 = 2049;
 
 #[derive(Debug, Default, Clone)]
@@ -38,30 +19,21 @@ pub struct AddArgs {
     pub warm: bool,
     pub no_cow: bool,
     pub min_size: u64,
-    /// Options forwarded to our internal `git worktree add --no-checkout`.
     pub forward: Vec<OsString>,
-    /// The user's arguments minus sharetree's own, for a plain passthrough.
     pub git_args: Vec<OsString>,
     pub separator: bool,
     pub path: Option<OsString>,
     pub commitish: Option<OsString>,
     pub no_checkout: bool,
     pub orphan: bool,
-    /// `--into-volume`: place the worktree in the configured sharetree volume.
     pub into_volume: bool,
-    /// `--no-volume`: never use a volume.
     pub no_volume: bool,
-    /// `--overlay`: fuse-overlayfs worktree over a base checkout (Linux).
     pub overlay: bool,
-    /// `--windows-clone`: enable ReFS block cloning on Windows.
     pub windows_clone: bool,
-    /// sharetree's own seed checkout: no hooks, no summary, no advice.
     pub internal: bool,
 }
 
 impl AddArgs {
-    /// The same request for another path, optionally locked with `reason`
-    /// (unless the user already passed --lock).
     pub fn relocated(&self, path: &Path, lock_reason: Option<&str>) -> AddArgs {
         let mut a = self.clone();
         if let Some(r) = lock_reason {
@@ -133,9 +105,6 @@ pub fn parse(args: &[OsString]) -> Result<AddArgs> {
             Some(s) if s.starts_with("--min-size=") => {
                 a.min_size = parse_size(Some(&OsString::from(&s[11..])))?;
             }
-            // Include Git's unambiguous abbreviations of the checkout
-            // switches. A checkout switch must never override our internal
-            // --no-checkout.
             Some(s) if s.starts_with("--no-c") && "--no-checkout".starts_with(s) => {
                 a.no_checkout = true;
                 a.git_args.push(arg.clone());
@@ -361,7 +330,6 @@ impl CloneProbe {
         if !enabled {
             return Self::Disabled;
         }
-        // Probe beside the destination rather than among its existing files.
         let anchor = util::nearest_existing(dest.parent().unwrap_or(dest));
         let t = Instant::now();
         #[cfg(any(unix, windows))]
@@ -415,9 +383,6 @@ impl CloneProbe {
     }
 }
 
-/// Prompt only when a person is there to answer: stdin and stderr are
-/// terminals, and `SHARETREE_NO_PROMPT` is not set (agents and scripts that
-/// run inside a pseudo-terminal set it so `add` never waits for input).
 fn can_prompt() -> bool {
     use std::io::IsTerminal;
     std::env::var_os("SHARETREE_NO_PROMPT").is_none_or(|v| v.is_empty() || v == "0")
@@ -425,8 +390,6 @@ fn can_prompt() -> bool {
         && std::io::stderr().is_terminal()
 }
 
-/// Ask whether to put this worktree in volume `v`, and store an
-/// "always"/"never" answer as this repository's `auto_volume`.
 fn ask_volume(v: &str, dest: &Path, common: &Path) -> Result<backend::Answer> {
     use std::io::{BufRead, Write};
     let anchor = util::nearest_existing(dest.parent().unwrap_or(dest));
@@ -446,7 +409,7 @@ fn ask_volume(v: &str, dest: &Path, common: &Path) -> Result<backend::Answer> {
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
             eprintln!();
-            break backend::Answer::NotNow; // EOF: change nothing
+            break backend::Answer::NotNow;
         }
         match backend::parse_answer(&line) {
             Some(a) => break a,
@@ -570,7 +533,6 @@ impl Placement {
     }
 }
 
-/// Run stock `git worktree add` with the user's arguments, unchanged.
 fn delegate(a: &AddArgs, cwd: &Path, why: &str) -> Result<i32> {
     if !a.quiet {
         eprintln!("sharetree: {why}; running plain `git worktree add`");
@@ -636,11 +598,6 @@ mod engine {
         unsupported: usize,
     }
 
-    /// The volume's seed for this repository: a detached, locked worktree at
-    /// `<repo_root>/.sharetree-seed`. Created on first use (one full checkout,
-    /// or reflinked from worktrees already in the volume), then advanced to
-    /// the requested commit when it is clean, so the new worktree shares
-    /// nearly every file with it.
     pub(super) fn ensure_seed(
         cwd: &Path,
         repo_root: &Path,
@@ -702,7 +659,6 @@ mod engine {
                 }
                 return Ok(seed);
             }
-            // Registered but gone: drop the stale registration.
             git::output(
                 cwd,
                 &[
@@ -739,8 +695,6 @@ mod engine {
         Ok(seed)
     }
 
-    /// The reflink engine proper: register, analyze donors, clone, verify,
-    /// seed the index, check out the rest.
     pub(super) fn create(
         a: &AddArgs,
         cwd: &Path,
@@ -771,8 +725,6 @@ mod engine {
             }
             None => {
                 let mut c = candidates(&wts, cwd, dest, dev);
-                // The volume's seed goes first: it is clean and at (or near)
-                // the target commit.
                 if let Some(seed) = preferred_donor {
                     if let Some(w) = wts
                         .iter()
@@ -807,8 +759,6 @@ mod engine {
                 .join(", ")
         ));
 
-        // Register, overlapped with the analysis (which reads only the object
-        // store and donor worktrees, never the new worktree).
         let guess_rev = a
             .commitish
             .clone()
@@ -873,8 +823,6 @@ mod engine {
             trace.phase("checkout", t);
             Ok((status, target, report))
         })();
-        // Git removes its unfinished checkout but keeps the branch, if
-        // any. After checkout succeeds a hook failure keeps the worktree.
         let (target, report) = match prepared {
             Ok((status, target, report)) if status.success() => (target, report),
             Ok((status, _, _)) => {
@@ -957,8 +905,6 @@ mod engine {
         }
     }
 
-    // Concurrent Git registrations can observe another add's incomplete
-    // commondir. This advisory lock coordinates sharetree registrations.
     fn register_lock(cwd: &Path) -> Result<fs::File> {
         let path = git::common_dir(cwd)?.join("sharetree-register.lock");
         let f = fs::OpenOptions::new()
@@ -1004,9 +950,6 @@ mod engine {
         }
     }
 
-    /// cwd's worktree, the main worktree, then the most recently modified
-    /// others (git-cow-worktree `candidatePool`), minus bare, prunable,
-    /// missing and other-device ones (git-twig RFD0016).
     fn candidates(wts: &[git::Worktree], cwd: &Path, dest: &Path, dev: u64) -> Vec<Cand> {
         let mut first = Vec::new();
         let mut others = Vec::new();
@@ -1034,8 +977,6 @@ mod engine {
                 others.push((mtime, c));
             }
         }
-        // A worktree nested inside another (e.g. .worktrees/x inside main)
-        // is "within" both; keep the deepest one first.
         first.sort_by_key(|c| {
             std::cmp::Reverse(
                 c.path.components().count() * usize::from(util::is_within(cwd, &c.path)),
@@ -1118,8 +1059,6 @@ mod engine {
         let mut donor = None;
         let mut best_score = 0;
         for (score, _, c) in ranked.into_iter().take(3) {
-            // A candidate's tree score is an upper bound before dirty
-            // paths are excluded; the current donor already beats this.
             if score <= best_score {
                 break;
             }
@@ -1129,8 +1068,6 @@ mod engine {
             } else {
                 &trees[&c.head]
             };
-            // Tracked files that differ from the donor's HEAD (by its stat
-            // cache: a filter only, every clone is hashed later).
             let dirty: HashSet<Vec<u8>> =
                 match git::output(&c.path, &["diff-index", "-z", "--name-only", "HEAD", "--"]) {
                     Ok(out) => git::split_z(&out).into_iter().collect(),
@@ -1140,8 +1077,6 @@ mod engine {
                     }
                 };
             trace.phase("donor status", t);
-            // A worktree mid-checkout reads as mostly dirty. Count only
-            // regular donor paths, which are the paths we can clone.
             let dirty_regular = dirty
                 .iter()
                 .filter(|path| tree.entries.get(*path).is_some_and(Entry::is_regular))
@@ -1189,8 +1124,6 @@ mod engine {
         entry: &'a Entry,
     }
 
-    /// We create files before Git's checkout sees them. Leave names whose
-    /// path semantics or Git-directory protections are ambiguous to Git.
     fn reusable_tree_path(path: &[u8]) -> bool {
         let name = std::str::from_utf8(path);
         if name.as_ref().is_ok_and(|name| {
@@ -1268,7 +1201,6 @@ mod engine {
         report.donor = Some(d.path.clone());
         let t = Instant::now();
 
-        // Clean donor files by blob id, to also reuse renamed/moved files.
         let mut by_oid: HashMap<&str, &[u8]> = HashMap::new();
         for (p, e) in &d.tree.entries {
             if e.is_regular() && !d.dirty.contains(p) && reusable_tree_path(p) {
@@ -1316,7 +1248,6 @@ mod engine {
             return Ok(report);
         }
 
-        // Parent directories, created the way git creates them (0777 & ~umask).
         let t = Instant::now();
         let mut dirs: Vec<&[u8]> = plan
             .iter()
@@ -1329,7 +1260,6 @@ mod engine {
         }
         trace.phase("mkdir", t);
 
-        // Clone.
         let t = Instant::now();
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
@@ -1363,9 +1293,6 @@ mod engine {
                             }
                             Err(CloneError::Unsupported(_)) => {
                                 let n = unsupported.fetch_add(1, Ordering::Relaxed) + 1;
-                                // The probe passed, so this is per-file (NOCOW
-                                // flag, ZFS dirty data...). Give up only if
-                                // nothing at all can be shared.
                                 if n >= 64 && ok_count.load(Ordering::Relaxed) == 0 {
                                     stop.store(true, Ordering::Relaxed);
                                 }
@@ -1378,7 +1305,6 @@ mod engine {
             }
         });
         let mut cloned = cloned.into_inner().expect("lock");
-        // Keep hashing reads in path order.
         cloned.sort_unstable();
         report.cloned = cloned.len();
         report.unsupported = unsupported.load(Ordering::Relaxed);
@@ -1387,11 +1313,6 @@ mod engine {
             return Ok(report);
         }
 
-        // Verify: hash every clone's own bytes in-process against the target
-        // blob. Measured alternatives, all slower or no faster on Btrfs and
-        // XFS (README, "Benchmarks"): hashing each clone as soon as it is
-        // made (cloning slowed down more than the overlap saved), and letting
-        // git write the other files meanwhile (it slowed the reads as much).
         let t = Instant::now();
         let fmt = git::object_format(dest)?;
         let next = AtomicUsize::new(0);
@@ -1424,8 +1345,6 @@ mod engine {
         Ok(report)
     }
 
-    /// Hashing a fresh clone is a cold read (its page cache is empty even
-    /// when the donor's is warm), so more readers than cloners pay off.
     fn hash_workers(n_items: usize) -> usize {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         cpus.clamp(4, 16).min(n_items.max(1))

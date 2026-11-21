@@ -1,42 +1,10 @@
-//! Windows block cloning (ReFS / Dev Drive) with
-//! `FSCTL_DUPLICATE_EXTENTS_TO_FILE`. **Off by default and untested**: it
-//! runs only with `sharetree add --windows-clone` or `windows_clone = true`
-//! in the config, and no Windows machine has run it yet.
-//!
-//! Rules from Microsoft's block-cloning documentation and the research note
-//! (§2.3), each mapped to code below:
-//!
-//! * the volume must report `FILE_SUPPORTS_BLOCK_REFCOUNTING` (a Dev Drive
-//!   before Windows 11 24H2 is ReFS but cannot clone): `volume_can_clone`;
-//! * the source is flushed with `FlushFileBuffers` first: a clone taken while
-//!   source data is still in the write cache produced permanently
-//!   zero-filled files (git-lfs #6312), and a worktree tool clones exactly
-//!   such freshly written files;
-//! * the destination's integrity-stream setting must equal the source's, and
-//!   a sparse source needs a sparse destination: `match_attributes`;
-//! * the destination is extended with `SetEndOfFile` before cloning;
-//! * regions start and end on cluster boundaries and each is < 4 GiB:
-//!   `clone_regions` (portable, unit-tested). The last region is rounded up
-//!   past the source's end of file to a cluster boundary, as Microsoft's
-//!   sample does; the destination keeps its exact length.
-//!
-//! Every clone is still hashed against the target blob before it enters the
-//! index (`index.rs`), so a wrong clone costs a rewrite by git, never a wrong
-//! file in the worktree.
-
-// The portable helpers are used only by the Windows engine.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-/// Microsoft: "each region must be less than 4 GiB".
 pub const MAX_REGION: u64 = (4 << 30) - 1;
 
-/// Split a clone of `len` bytes into `(offset, byte_count)` regions that
-/// start on cluster boundaries, have cluster-multiple lengths, and are each
-/// below 4 GiB. The total covers `len` rounded up to whole clusters.
 pub fn clone_regions(len: u64, cluster: u64) -> Vec<(u64, u64)> {
     assert!(cluster.is_power_of_two(), "cluster size {cluster}");
     let total = len.div_ceil(cluster) * cluster;
-    // Largest cluster multiple below 4 GiB.
     let step = MAX_REGION / cluster * cluster;
     let mut v = Vec::new();
     let mut off = 0;
@@ -82,7 +50,6 @@ mod sys {
 
     use super::clone_regions;
 
-    /// winnt.h (windows-sys has it under System_SystemServices).
     const FILE_SUPPORTS_BLOCK_REFCOUNTING: u32 = 0x0800_0000;
 
     fn wide(p: &Path) -> Vec<u16> {
@@ -93,10 +60,8 @@ mod sys {
         f.as_raw_handle() as HANDLE
     }
 
-    /// Does the volume holding `f` support block cloning?
     pub fn volume_can_clone(f: &File) -> io::Result<bool> {
         let mut flags = 0u32;
-        // SAFETY: valid handle; null buffers with zero sizes are allowed.
         let ok = unsafe {
             GetVolumeInformationByHandleW(
                 handle(f),
@@ -117,7 +82,6 @@ mod sys {
 
     fn volume_root(path: &Path) -> io::Result<Vec<u16>> {
         let mut root = vec![0u16; 1024];
-        // SAFETY: NUL-terminated input, output buffer of the stated length.
         if unsafe { GetVolumePathNameW(wide(path).as_ptr(), root.as_mut_ptr(), root.len() as u32) }
             == 0
         {
@@ -126,13 +90,9 @@ mod sys {
         Ok(root)
     }
 
-    /// Serial number of the volume holding `path` (a reflink cannot cross
-    /// volumes).
     pub fn volume_serial(path: &Path) -> io::Result<u64> {
         let root = volume_root(path)?;
         let mut serial = 0u32;
-        // SAFETY: NUL-terminated root, out-pointer to a local, null buffers
-        // with zero sizes.
         let ok = unsafe {
             GetVolumeInformationW(
                 root.as_ptr(),
@@ -151,11 +111,9 @@ mod sys {
         Ok(serial as u64)
     }
 
-    /// Cluster size of the volume holding `path`.
     pub fn cluster_size(path: &Path) -> io::Result<u64> {
         let root = volume_root(path)?;
         let (mut spc, mut bps, mut free, mut total) = (0u32, 0u32, 0u32, 0u32);
-        // SAFETY: out-pointers to locals.
         if unsafe { GetDiskFreeSpaceW(root.as_ptr(), &mut spc, &mut bps, &mut free, &mut total) }
             == 0
         {
@@ -177,7 +135,6 @@ mod sys {
         output_size: u32,
     ) -> io::Result<u32> {
         let mut returned = 0u32;
-        // SAFETY: buffers are valid for their lengths; synchronous handle.
         let ok = unsafe {
             DeviceIoControl(
                 h,
@@ -196,7 +153,6 @@ mod sys {
         Ok(returned)
     }
 
-    /// Give `dst` the source's integrity-stream and sparse settings.
     fn match_attributes(src: &File, dst: &File, src_attrs: u32) -> io::Result<()> {
         let mut info = FSCTL_GET_INTEGRITY_INFORMATION_BUFFER::default();
         let info_size = std::mem::size_of_val(&info) as u32;
@@ -250,7 +206,6 @@ mod sys {
         let info = FILE_END_OF_FILE_INFO {
             EndOfFile: len as i64,
         };
-        // SAFETY: documented struct for FileEndOfFileInfo.
         let ok = unsafe {
             SetFileInformationByHandle(
                 handle(f),
@@ -265,10 +220,6 @@ mod sys {
         Ok(())
     }
 
-    /// Open a donor for cloning: not following reparse points, and denying
-    /// other writers while it is open (share mode read only). Write access
-    /// is requested only because `FlushFileBuffers` requires it; nothing is
-    /// written.
     pub fn open_source(src: &Path) -> io::Result<File> {
         OpenOptions::new()
             .access_mode(GENERIC_READ | GENERIC_WRITE)
@@ -281,10 +232,7 @@ mod sys {
         m.is_file() && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
 
-    /// Flush `src`, create `dst` (new), match its attributes, size it, and
-    /// clone `len` bytes region by region. On error `dst` is removed.
     pub fn clone_file(src: &File, src_attrs: u32, dst: &Path, len: u64) -> io::Result<File> {
-        // SAFETY: valid handle opened with write access.
         if unsafe { FlushFileBuffers(handle(src)) } == 0 {
             return Err(io::Error::last_os_error());
         }

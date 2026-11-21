@@ -1,6 +1,3 @@
-//! Drop-in invariant scenarios (design §8.8): every `sharetree add` must produce
-//! the same worktree as stock `git worktree add`.
-
 #![cfg(unix)]
 
 mod common;
@@ -13,10 +10,7 @@ use std::path::Path;
 
 use common::*;
 
-/// Create `stock` with git and `cow` with sharetree (both detached at `rev`),
-/// assert they are equivalent, return sharetree's stderr.
 fn compare_at(sb: &Sandbox, from: &Path, rev: &str, stock: &str, cow: &str) -> String {
-    // sharetree first, so the stock worktree is never its donor.
     let err = sb.sharetree_ok(
         from,
         &["add", "--detach", &sb.p(cow).to_string_lossy(), rev],
@@ -41,7 +35,6 @@ fn identity() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
-    // 12 src files + big.bin + docs/readme.md + bin/tool.sh, all >= 2049 bytes.
     assert_eq!(reflinked(&err), 15, "{err}");
 }
 
@@ -57,8 +50,6 @@ fn donor_one_commit_behind() {
     let after = sb.commit_all(&main, "second");
     sb.git(&main, &["checkout", "-q", "--detach", &before]);
     let err = compare_at(&sb, &main, &after, "stock", "cow");
-    // 15 large files in the target; the rewritten and the brand-new file
-    // cannot come from the donor, the renamed one can (matched by blob id).
     assert_eq!(reflinked(&err), 13, "{err}");
 }
 
@@ -107,12 +98,9 @@ fn ranks_donors_after_excluding_locally_modified_files() {
 fn stat_clean_but_modified_donor() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
-    // Make git's stat check blind to an in-place, same-size edit.
     sb.git(&main, &["config", "core.trustctime", "false"]);
     sb.git(&main, &["config", "core.checkStat", "minimal"]);
     let f = main.join("big.bin");
-    // An old mtime, recorded in a freshly written index, so the entry is not
-    // racily clean (git would re-hash a racy entry and notice the edit).
     let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
     fs::File::options()
         .write(true)
@@ -150,7 +138,6 @@ fn dirty_donor() {
     fs::set_permissions(main.join("big.bin"), fs::Permissions::from_mode(0o755)).unwrap();
     write(&main.join("untracked.bin"), &bytes(6, 9000));
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
-    // 3 dirty paths are excluded (a mode-only change also counts as dirty).
     assert_eq!(reflinked(&err), 12, "{err}");
     assert!(!sb.p("cow/untracked.bin").exists());
 }
@@ -165,7 +152,6 @@ fn exec_bit_change() {
     let after = sb.commit_all(&main, "modes");
     sb.git(&main, &["checkout", "-q", "--detach", &before]);
     let err = compare_at(&sb, &main, &after, "stock", "cow");
-    // Same blobs, so they are reused with the target's mode.
     assert_eq!(reflinked(&err), 15, "{err}");
     let m = |p: &str| fs::metadata(sb.p(p)).unwrap().permissions().mode() & 0o777;
     assert_eq!(m("cow/big.bin"), m("stock/big.bin"));
@@ -217,7 +203,6 @@ fn sparse_checkout() {
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
     assert!(!sb.p("cow/src/mod3").exists());
     assert!(sb.p("cow/src/mod2/data2.bin").exists());
-    // src/mod2 + bin/tool.sh + top-level files in the cone (big.bin).
     assert_eq!(reflinked(&err), 3, "{err}");
 }
 
@@ -241,7 +226,6 @@ fn crlf_and_text_attributes() {
         .unwrap()
         .windows(2)
         .any(|w| w == b"\r\n"));
-    // crlf.txt is converted on checkout, so git writes it; the others are raw.
     assert_eq!(reflinked(&err), 17, "{err}");
 }
 
@@ -264,7 +248,6 @@ fn autocrlf_true_delegates_text_files() {
 
 #[test]
 fn smudge_filter_paths_are_left_to_git() {
-    // Stands in for LFS: a filter whose checkout output differs from the blob.
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
     sb.git(&main, &["config", "filter.upper.smudge", "tr a-z A-Z"]);
@@ -272,7 +255,6 @@ fn smudge_filter_paths_are_left_to_git() {
     let text: Vec<u8> = (0..500)
         .flat_map(|i| format!("lower case {i}\n").into_bytes())
         .collect();
-    // `*.po` names a driver nobody configured: git ignores it, so it is raw.
     write(
         &main.join(".gitattributes"),
         b"*.up filter=upper\n*.po filter=gettext-no-location\n",
@@ -386,7 +368,6 @@ fn new_branch_and_dwim_branch() {
         sb.git(&sb.p("cow"), &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/c1"
     );
-    // No commit-ish and no -b: git names the branch after the directory.
     sb.sharetree_ok(&main, &["add", &sb.p("feature").to_string_lossy()]);
     assert_eq!(
         sb.git(&sb.p("feature"), &["symbolic-ref", "HEAD"]).trim(),
@@ -404,7 +385,6 @@ fn donor_is_another_linked_worktree() {
     write(&w1.join("src/mod0/data0.bin"), &bytes(31, 6000));
     sb.git(&w1, &["commit", "-qam", "on w1"]);
     let rev = sb.git(&w1, &["rev-parse", "HEAD"]).trim().to_string();
-    // From inside w1, w1 is the preferred donor.
     sb.git(
         &w1,
         &[
@@ -735,7 +715,6 @@ fn passthrough_cases_delegate() {
     sb.git(&main, &["config", "core.splitIndex", "true"]);
     let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("si").to_string_lossy()]);
     assert!(err.contains("core.splitIndex"), "{err}");
-    // Errors from git surface unchanged.
     let out = sb.sharetree(&main, &["add", "--detach", &sb.p("si").to_string_lossy()]);
     assert!(!out.status.success());
 }

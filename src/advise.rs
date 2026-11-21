@@ -1,11 +1,3 @@
-//! Dependency advisor (research note §6): on any filesystem the larger win
-//! is usually a shared package store or compiler cache, not the checkout.
-//! sharetree detects lockfiles in the worktree and says what each tool will do
-//! on this filesystem (clone, hardlink or copy) and what to change.
-//!
-//! Detection is pure (a list of tracked paths in, findings out) so it is
-//! unit-tested; the environment is gathered once into `EnvView`.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +36,6 @@ impl Eco {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Detected {
     eco: Eco,
-    /// Marker files that triggered it (worktree-relative, `/`-separated).
     files: Vec<String>,
 }
 
@@ -63,7 +54,6 @@ fn eco_of(name: &str) -> Option<Eco> {
     })
 }
 
-/// Ecosystems used in a tree, from its (tracked) paths.
 fn detect(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Detected> {
     let mut found: Vec<Detected> = Vec::new();
     for path in paths {
@@ -83,7 +73,6 @@ fn detect(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Detected> {
             }),
         }
     }
-    // pip markers next to a uv project are uv's business.
     if found.iter().any(|d| d.eco == Eco::Uv) {
         found.retain(|d| d.eco != Eco::Pip);
     }
@@ -96,14 +85,10 @@ fn detect(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Detected> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsClass {
-    /// The reflink probe succeeded here.
     Reflink,
-    /// It failed: tools fall back to hardlinks (same filesystem) or copies.
     NoReflink,
 }
 
-/// Environment facts the advice depends on. `*_same_fs`: whether the tool's
-/// store/cache is on the worktree's filesystem (hardlinks need that).
 #[derive(Clone, Debug, Default)]
 struct EnvView {
     cargo_target_dir: Option<String>,
@@ -118,9 +103,7 @@ struct EnvView {
     pnpm_store: Option<PathBuf>,
     pnpm_store_same_fs: Option<bool>,
     goflags: Option<String>,
-    /// The repo's `.cargo/config.toml` sets `target-dir` / `build-dir`.
     cargo_config_shared_dir: bool,
-    /// Directory holding the worktrees (for SCCACHE_BASEDIRS).
     worktrees_parent: Option<PathBuf>,
 }
 
@@ -137,9 +120,7 @@ struct DependencyContext {
 
 #[derive(Clone, Debug)]
 struct Advice {
-    /// One line for the hint after `sharetree add`; None when nothing to do.
     short: Option<String>,
-    /// Everything, for `sharetree doctor`.
     details: Vec<String>,
 }
 
@@ -151,7 +132,6 @@ fn yes_no(b: Option<bool>) -> &'static str {
     }
 }
 
-/// The link mode package stores end up with here.
 fn link_mode_summary(fs: &Filesystem) -> String {
     match (fs.class, fs.platform) {
         (FsClass::Reflink, _) => format!(
@@ -316,9 +296,6 @@ fn advise(d: &Detected, c: &DependencyContext) -> Advice {
     Advice { short, details }
 }
 
-// ---------------------------------------------------------------------------
-// Gathering facts
-
 fn env_s(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
@@ -329,8 +306,6 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Same filesystem as `wt`? Judged at the nearest existing ancestor, since a
-/// store that does not exist yet will be created there.
 fn same_fs(a: &Path, wt: &Path) -> Option<bool> {
     let a = crate::util::nearest_existing(a);
     #[cfg(unix)]
@@ -398,7 +373,6 @@ fn cargo_config_shares_dir(wt: &Path) -> bool {
     })
 }
 
-/// `exact`: ask pnpm itself for its store (slow: starts node), for doctor.
 fn dependency_context(
     wt: &Path,
     fs: Filesystem,
@@ -442,9 +416,6 @@ fn dependency_context(
         } else {
             None
         };
-        // Without asking pnpm: it keeps one store per disk (creating
-        // `<fs root>/.pnpm-store` when the default store is elsewhere), so
-        // hardlinking is the expected outcome; leave the store unknown.
         if let Some(p) = asked {
             v.pnpm_store_same_fs = same_fs(&p, wt);
             v.pnpm_store = Some(p);
@@ -489,8 +460,6 @@ impl Filesystem {
     }
 }
 
-/// The short hint printed after `sharetree add`. Silent when no ecosystem
-/// needs a change.
 pub(crate) fn print_add_hint(wt: &Path) {
     if std::env::var_os("SHARETREE_NO_ADVICE").is_some_and(|v| !v.is_empty() && v != "0") {
         return;
@@ -514,7 +483,6 @@ pub(crate) fn print_add_hint(wt: &Path) {
     eprintln!("sharetree:   (details: `sharetree doctor`; silence: SHARETREE_NO_ADVICE=1)");
 }
 
-/// `sharetree doctor [<path>]`.
 pub(crate) fn run_doctor(args: &[OsString]) -> Result<i32> {
     let mut path: Option<PathBuf> = None;
     for a in args {
@@ -538,7 +506,6 @@ pub(crate) fn run_doctor(args: &[OsString]) -> Result<i32> {
         }
     );
 
-    // Backend `sharetree add` would pick for a sibling of this worktree.
     if let Ok(common) = git::common_dir(&wt) {
         let cfg = crate::config::Config::load()?;
         let vol = cfg.volume_for(&common);

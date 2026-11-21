@@ -1,7 +1,3 @@
-//! `sharetree rm`: remove a worktree with `git worktree remove`'s safety checks,
-//! then rename it into a trash directory and delete it in the background
-//! (lane's park-then-sweep design, design §8.5).
-
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
@@ -42,7 +38,6 @@ fn parse(args: &[OsString]) -> Result<RmArgs> {
     })
 }
 
-/// `<worktree>/.git` is a file "gitdir: <admin dir>".
 pub(crate) fn admin_dir(wt: &Path) -> Result<PathBuf> {
     read_admin_dir(wt, wt)
 }
@@ -173,8 +168,6 @@ impl ParkedWorktree {
         fs::create_dir_all(&trash)?;
         fs::create_dir_all(&admin_trash)?;
         let checkout = trash.join(&id);
-        // Renaming the admin directory is one atomic change, like parking
-        // the checkout. Failure can restore the whole worktree intact.
         let parked = Self {
             checkout,
             admin: admin_trash.join(format!("{id}-admin")),
@@ -258,8 +251,6 @@ pub fn run(args: &[OsString]) -> Result<i32> {
     }
     let cwd = std::env::current_dir()?;
     let requested = util::absolutize(&a.path, &cwd);
-    // The generated volume alias can still be read when its target is
-    // unmounted. Canonicalization alone returns the alias in that case.
     let alias = requested
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink());
@@ -364,7 +355,6 @@ pub fn run(args: &[OsString]) -> Result<i32> {
                 "sharetree: cannot park {} ({e}); using `git worktree remove`",
                 wt.path.display()
             );
-            // Sharetree's own volume lock has already passed our checks.
             let git_force = if ours && wt.locked { 2 } else { a.force };
             return remove_with_git(&cwd, &wt.path, git_force, link);
         }
@@ -410,7 +400,7 @@ fn spawn_sweeper(parked: &[&Path]) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0) // survive the terminal's Ctrl-C
+        .process_group(0)
         .spawn()
         .context("spawning background delete")?;
     Ok(())
@@ -424,8 +414,6 @@ fn spawn_sweeper(parked: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// `sharetree __sweep <parked dir>`: background deletion. Only ever deletes a
-/// path inside a sharetree trash directory.
 pub fn sweep_cmd(args: &[OsString]) -> Result<i32> {
     for a in args {
         let p = PathBuf::from(a);

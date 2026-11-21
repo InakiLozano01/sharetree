@@ -229,6 +229,9 @@ metadata ("inline"). Those can't share blocks, so cloning them saves nothing.
 On compressed Btrfs, files of a few KiB that compress well are stored inline
 too.
 
+[Architecture decision records](docs/adr/README.md) explain the constraints
+behind checkout verification and the other worktree backends.
+
 ## Why `du` lies, and how to measure
 
 `du` adds up each file's blocks and cannot tell that two files share them. Ten

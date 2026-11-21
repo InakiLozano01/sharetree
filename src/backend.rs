@@ -1,18 +1,3 @@
-//! Which backend `sharetree add` uses (research note §7.2). Pure, so the
-//! policy is unit-tested apart from the filesystem probing that feeds it.
-//!
-//! 1. A real reflink probe beside the destination. Success means the
-//!    existing reflink engine runs there. If the destination is inside a
-//!    sharetree volume, the volume's seed checkout is made the donor.
-//! 2. The probe failed and the repository has a configured volume (Linux
-//!    loop image, Windows Dev Drive): with `--into-volume` or
-//!    `auto_volume = true` the worktree is placed inside the volume; with
-//!    `auto_volume = false` plain git. When the user has not chosen
-//!    (`auto_volume` unset for the repository and globally), `Ask`: the
-//!    caller prompts on a terminal (`Answer`) and otherwise uses plain git
-//!    with a hint on how to choose.
-//! 3. Nothing configured: plain git, with a hint pointing to `sharetree setup`.
-
 use crate::config::Volume;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,42 +24,28 @@ impl Platform {
 
 #[derive(Clone, Debug, Default)]
 pub struct Inputs<'a> {
-    /// The reflink probe beside the destination succeeded.
     pub probe_ok: bool,
-    /// The destination already lies inside the configured volume.
     pub dest_in_volume: bool,
     pub volume: Option<&'a Volume>,
-    /// `auto_volume` for this repository (config); None: not chosen yet.
     pub auto_volume: Option<bool>,
-    /// `--into-volume`.
     pub into_volume: bool,
-    /// `--no-volume`.
     pub no_volume: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hint {
     None,
-    /// A volume exists and the user has not chosen whether to use it, but
-    /// there is no terminal to ask on.
     VolumeUndecided(String),
-    /// Suggest `sharetree setup volume` (Linux).
     SetupVolume,
-    /// Suggest `sharetree setup devdrive` (Windows).
     SetupDevDrive,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Decision<'a> {
-    /// Reflink at the requested destination.
     Reflink,
-    /// Use the configured volume at the requested path or relocate into it.
     Volume(&'a Volume),
-    /// Ask before using the volume. Without a terminal, use plain Git with a hint.
     Ask(&'a Volume),
-    /// Plain `git worktree add` at the requested destination.
     Plain(Hint),
-    /// Refuse: the user asked for something that cannot be done.
     Fail(String),
 }
 
@@ -118,23 +89,17 @@ pub fn decide<'a>(i: &Inputs<'a>, platform: Platform) -> Decision<'a> {
     }
     match (i.volume, i.auto_volume) {
         (Some(v), Some(true)) => Decision::Volume(v),
-        // The user said "never": no nagging.
         (Some(_), Some(false)) => Decision::Plain(Hint::None),
         (Some(v), None) => Decision::Ask(v),
         (None, _) => Decision::Plain(setup_hint),
     }
 }
 
-/// The user's answer to "use the volume?".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
-    /// Use the volume this time.
     Once,
-    /// Use it now and from now on (`auto_volume = true`).
     Always,
-    /// Plain checkout this time; ask again next time.
     NotNow,
-    /// Plain checkout now and from now on (`auto_volume = false`).
     Never,
 }
 
@@ -143,7 +108,6 @@ impl Answer {
         matches!(self, Answer::Once | Answer::Always)
     }
 
-    /// What to store as `auto_volume`, if anything.
     pub fn persist(self) -> Option<bool> {
         match self {
             Answer::Always => Some(true),
@@ -155,8 +119,6 @@ impl Answer {
 
 pub const ASK_CHOICES: &str = "[y]es this time / [a]lways / [n]ot this time / ne[v]er";
 
-/// Parse a typed answer. Empty input (just Enter) means "not this time",
-/// the choice that changes nothing.
 pub fn parse_answer(s: &str) -> Option<Answer> {
     match s.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" | "once" => Some(Answer::Once),
@@ -167,7 +129,6 @@ pub fn parse_answer(s: &str) -> Option<Answer> {
     }
 }
 
-/// One-paragraph hint printed after a plain fallback.
 pub fn hint_text(h: &Hint, fs: &str) -> Option<String> {
     match h {
         Hint::None => None,
@@ -269,7 +230,6 @@ mod tests {
         i.auto_volume = None;
         i.into_volume = true;
         assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
-        // An explicit --into-volume wins even where reflinks work.
         i.probe_ok = true;
         assert_eq!(decide(&i, Platform::Linux), Decision::Volume(&v));
     }
@@ -322,7 +282,6 @@ mod tests {
     #[test]
     fn windows_dev_drive_destination_goes_through_placement() {
         let v = volume("devdrive");
-        // A Dev Drive is still a placement destination with cloning disabled.
         let i = Inputs {
             dest_in_volume: true,
             volume: Some(&v),
@@ -361,7 +320,6 @@ mod tests {
                 "{i:?}"
             );
         }
-        // No volume configured: nothing to ask about.
         assert_eq!(
             decide(&inp(), Platform::Linux),
             Decision::Plain(Hint::SetupVolume)

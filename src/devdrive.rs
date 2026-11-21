@@ -1,23 +1,9 @@
-//! `sharetree setup devdrive` (Windows): PowerShell that creates a dynamically
-//! expanding VHDX, formats it as a ReFS Dev Drive, and registers a logon
-//! scheduled task that re-attaches it (VHDs do not re-attach at boot).
-//!
-//! Generated here and unit-tested as text on every platform; on Windows
-//! sharetree runs it elevated (one UAC prompt). `--print` shows it instead.
-//! Sources: Learn "Set up a Dev Drive on Windows 11" (build 22621.2338+,
-//! 50 GB minimum, `Format-Volume -DevDrive`), "Block cloning on ReFS"
-//! (Dev Drive block cloning from Windows 11 24H2, build 26100). See the
-//! research note §3.1 and §7.4.
-
 use anyhow::{bail, Result};
 
-/// The Dev Drive minimum, in the decimal GB Learn states ("50 GB").
 pub const MIN_SIZE_BYTES: u64 = 50_000_000_000;
 pub const TASK_NAME: &str = "sharetree-devdrive";
-/// First build with Dev Drive (with UBR 2338).
 pub const MIN_BUILD: u32 = 22621;
 pub const MIN_UBR: u32 = 2338;
-/// Windows 11 24H2: block cloning on Dev Drive.
 pub const CLONE_BUILD: u32 = 26100;
 
 #[derive(Clone, Debug)]
@@ -26,9 +12,7 @@ pub struct Opts {
     pub size_bytes: u64,
     pub letter: char,
     pub label: String,
-    /// `DOMAIN\user` whose logon re-attaches the drive.
     pub user: String,
-    /// Where the script reports `ok <letter>` or `error <message>`.
     pub result_file: String,
 }
 
@@ -65,10 +49,7 @@ impl Opts {
     }
 }
 
-/// A PowerShell single-quoted string literal.
 pub fn ps_quote(s: &str) -> String {
-    // Single quotes (and the typographic ones PowerShell also accepts as
-    // quote characters) are escaped by doubling.
     let mut out = String::from("'");
     for c in s.chars() {
         if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
@@ -80,7 +61,6 @@ pub fn ps_quote(s: &str) -> String {
     out
 }
 
-/// Base64 (standard alphabet, padded).
 pub fn base64(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -102,7 +82,6 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
-/// `powershell -EncodedCommand` takes Base64 of UTF-16LE.
 pub fn encode_command(script: &str) -> String {
     let bytes: Vec<u8> = script
         .encode_utf16()
@@ -111,8 +90,6 @@ pub fn encode_command(script: &str) -> String {
     base64(&bytes)
 }
 
-/// What the logon task runs: attach the VHDX if it is not attached, and give
-/// the partition its letter back if Windows did not.
 pub fn reattach_script(o: &Opts) -> String {
     format!(
         "$ErrorActionPreference = 'Stop'\n\
@@ -125,7 +102,6 @@ pub fn reattach_script(o: &Opts) -> String {
     )
 }
 
-/// The elevated, one-time setup script.
 pub fn setup_script(o: &Opts) -> String {
     let reattach = reattach_script(o);
     let reattach_comment: String = reattach.lines().map(|l| format!("#   {l}\n")).collect();
@@ -218,7 +194,6 @@ try {{
     )
 }
 
-/// Undo setup: remove the task, detach the VHDX, optionally delete it.
 pub fn teardown_script(o: &Opts, delete_image: bool, force: bool) -> String {
     let inspect = if delete_image && !force {
         r#"    if ($img) {
@@ -265,7 +240,6 @@ pub fn teardown_script(o: &Opts, delete_image: bool, force: bool) -> String {
     )
 }
 
-/// The command line that runs `script` elevated (UAC prompt) and waits.
 pub fn elevate_command(script_path: &str) -> String {
     format!(
         "$ErrorActionPreference = 'Stop'; Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{})",
@@ -273,7 +247,6 @@ pub fn elevate_command(script_path: &str) -> String {
     )
 }
 
-/// Parse the result file the scripts write.
 pub fn parse_result(text: &str) -> Result<Option<char>> {
     let t = text.trim_start_matches('\u{feff}').trim();
     if t == "ok" {
@@ -329,7 +302,6 @@ mod tests {
         ] {
             assert_eq!(base64(i.as_bytes()), o);
         }
-        // "ab" in UTF-16LE is 61 00 62 00.
         assert_eq!(encode_command("ab"), "YQBiAA==");
     }
 
@@ -359,11 +331,8 @@ mod tests {
         ] {
             assert!(s.contains(needle), "missing {needle:?} in\n{s}");
         }
-        // The task's command is the reattach script, encoded, and shown
-        // decoded in the header for review.
         assert!(s.contains(&encode_command(&reattach_script(&o))));
         assert!(s.contains("#   if (-not $img.Attached)"), "{s}");
-        // Braces balance (format! escaping mistakes would show up here).
         let open = s.matches('{').count();
         let close = s.matches('}').count();
         assert_eq!(open, close, "{s}");

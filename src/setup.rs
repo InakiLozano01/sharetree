@@ -1,16 +1,3 @@
-//! `sharetree setup ...`: one-time creation of a copy-on-write volume for
-//! filesystems that cannot reflink (research note §7.3, §7.4).
-//!
-//! ```text
-//! sharetree setup volume   [--fs btrfs|xfs] [--size N] [--image P] [--name N]
-//!                          [--label L] [--auto] [--no-unit] [--print]
-//! sharetree setup devdrive [--size N] [--letter X] [--vhdx P] [--label L] [--print]
-//! sharetree setup status
-//! sharetree setup mount    [--volume N]
-//! sharetree setup teardown [--volume N] [--delete-image] [--force] [--print]
-//! sharetree setup auto     on|off|ask [--repo]
-//! ```
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -32,7 +19,6 @@ usage:
   sharetree setup auto     on|off|ask [--repo]
 ";
 
-/// Tiny option scanner: `--key value`, `--key=value` and flags.
 struct Opts {
     args: Vec<String>,
 }
@@ -127,7 +113,6 @@ fn pick_volume<'c>(cfg: &'c Config, name: Option<&str>) -> Result<&'c Volume> {
     }
 }
 
-/// `auto_volume` as shown to the user.
 pub fn auto_desc(v: Option<bool>) -> &'static str {
     match v {
         Some(true) => "true",
@@ -136,7 +121,6 @@ pub fn auto_desc(v: Option<bool>) -> &'static str {
     }
 }
 
-/// One line: where the volume is and whether it is mounted.
 pub fn volume_state_line(v: &Volume) -> String {
     match volume::current_state(v) {
         State::Mounted { mountpoint, device } => format!(
@@ -165,9 +149,6 @@ fn user_name() -> String {
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// setup volume (Linux)
 
 fn setup_volume(args: &[OsString]) -> Result<i32> {
     let mut o = Opts::new(args)?;
@@ -239,7 +220,6 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
     let _lock = (!a.print).then(config::lock_volume_setup).transpose()?;
     let cfg = Config::load()?;
     if let Some(v) = cfg.volume(&a.name).cloned() {
-        // Idempotent: make sure it is mounted, report, done.
         if a.print {
             println!(
                 "volume '{}' already exists: {}",
@@ -557,9 +537,6 @@ fn remove_unit(unit: &str) {
     let _ = volume::systemctl_user(&["daemon-reload"]);
 }
 
-// ---------------------------------------------------------------------------
-// setup mount / status / auto
-
 fn mount(args: &[OsString]) -> Result<i32> {
     let mut o = Opts::new(args)?;
     let name = o.value("--volume")?;
@@ -710,10 +687,6 @@ fn status(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// teardown
-
-/// Worktrees inside a mounted volume: (path, git common dir, is_seed).
 fn worktrees_in(root: &Path) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
     let mut v = Vec::new();
     for repo in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
@@ -805,7 +778,6 @@ fn teardown(args: &[OsString]) -> Result<i32> {
         }
     }
 
-    // Worktrees inside: seeds are sharetree's; other ones are the user's.
     let mounted = match volume::try_current_state(&v)? {
         State::Mounted { mountpoint, .. } => Some(mountpoint),
         State::ImageMissing => None,
@@ -886,9 +858,6 @@ fn teardown(args: &[OsString]) -> Result<i32> {
     );
     Ok(0)
 }
-
-// ---------------------------------------------------------------------------
-// Windows Dev Drive
 
 fn devdrive_opts(vhdx: &str, size: u64, letter: char, label: &str) -> Result<devdrive::Opts> {
     let data = config::data_dir()
@@ -1010,8 +979,6 @@ fn teardown_devdrive(v: &Volume, delete: bool, force: bool, print: bool) -> Resu
     Ok(0)
 }
 
-/// Write `script` next to the config data and run it elevated (one UAC
-/// prompt), returning what it wrote to its result file.
 fn run_elevated(
     opts: &mut devdrive::Opts,
     file: &str,
@@ -1026,7 +993,6 @@ fn run_elevated(
         .to_str()
         .context("result path must be Unicode")?
         .into();
-    // A UTF-8 BOM makes Windows PowerShell 5.1 read the file as UTF-8.
     std::fs::write(&path, format!("\u{feff}{}", script(opts)))?;
     eprintln!(
         "sharetree: running {} elevated (review it with --print)",

@@ -1,13 +1,3 @@
-//! Per-file copy-on-write clone primitives.
-//!
-//! Linux: `ioctl(FICLONE)` on a freshly created destination.
-//! macOS: `fclonefileat(CLONE_NOFOLLOW)`, then normalize the metadata APFS
-//! copied (BSD flags, xattrs, mode), as git-twig does.
-//! Never a byte copy, never a hardlink: callers fall back to git itself.
-//!
-//! The errno classification follows lukeed/lane `cow.rs` (MIT), plus EAGAIN
-//! (OpenZFS may refuse to clone dirty data).
-
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -39,8 +29,6 @@ fn classify(e: io::Error) -> CloneError {
     }
 }
 
-/// Open a donor file without following a final symlink and without blocking
-/// on a FIFO that replaced it.
 pub(super) fn open_source(src: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -48,8 +36,6 @@ pub(super) fn open_source(src: &Path) -> io::Result<File> {
         .open(src)
 }
 
-/// Open a file for reading without following a final symlink (used to hash
-/// a fresh clone).
 pub fn open_no_follow(p: &Path) -> io::Result<File> {
     open_source(p)
 }
@@ -58,7 +44,6 @@ pub fn is_plain_file(m: &Metadata) -> bool {
     m.is_file()
 }
 
-/// What must not change between "decide to clone" and "clone done".
 #[derive(PartialEq, Eq)]
 struct Stamp(u64, i64, i64, i64, i64, u64, u64);
 
@@ -78,8 +63,6 @@ pub(super) fn same_source(before: &Metadata, after: &Metadata) -> bool {
     stamp(before) == stamp(after)
 }
 
-/// Clone the open `src` into a new file `dst` created with `create_mode`
-/// (subject to umask and default ACLs, exactly like git's own open()).
 #[cfg(target_os = "linux")]
 pub(super) fn clone_into_new<'a>(
     src: &File,
@@ -88,7 +71,6 @@ pub(super) fn clone_into_new<'a>(
     create_mode: u32,
 ) -> Result<PendingFile<'a>, CloneError> {
     use std::os::fd::AsRawFd;
-    // _IOW(0x94, 9, int), include/uapi/linux/fs.h
     const FICLONE: u64 = 0x4004_9409;
     let d = OpenOptions::new()
         .read(true)
@@ -100,7 +82,6 @@ pub(super) fn clone_into_new<'a>(
         .map_err(CloneError::Io)?;
     let pending = PendingFile::new(dst, d);
     let d = pending.file.as_ref().expect("open clone");
-    // SAFETY: both descriptors are open for the duration of the call.
     let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as _, src.as_raw_fd()) };
     if rc != 0 {
         return Err(classify(io::Error::last_os_error()));
@@ -118,7 +99,6 @@ pub(super) fn clone_into_new<'a>(
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
-    // sys/clonefile.h; not exported by the libc crate.
     const CLONE_NOFOLLOW: u32 = 0x0001;
     const CLONE_NOOWNERCOPY: u32 = 0x0002;
     extern "C" {
@@ -131,7 +111,6 @@ pub(super) fn clone_into_new<'a>(
     }
     let c = CString::new(dst.as_os_str().as_bytes())
         .map_err(|e| CloneError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-    // SAFETY: valid fd and NUL-terminated path.
     let rc = unsafe {
         fclonefileat(
             src.as_raw_fd(),
@@ -207,8 +186,6 @@ pub(super) fn clone_into_new<'a>(
     )))
 }
 
-/// Clone an ignored cache file, keeping its permission bits and timestamps
-/// (build tools compare mtimes). Returns the file size.
 pub fn clone_preserving(src: &Path, dst: &Path) -> Result<u64, CloneError> {
     let s = open_source(src).map_err(CloneError::Io)?;
     let m = s.metadata().map_err(CloneError::Io)?;
@@ -236,8 +213,6 @@ pub(super) fn probe_clone<'a>(
     let src = open_source(source.path).map_err(|e| e.to_string())?;
     let metadata = src.metadata().map_err(|e| e.to_string())?;
     let mut clone = clone_into_new(&src, &metadata, dst, 0o600);
-    // OpenZFS can refuse to clone dirty blocks. Sync only on retry, since
-    // on Btrfs an fsync can wait for a whole transaction commit.
     if matches!(&clone, Err(CloneError::Unsupported(e)) if e.raw_os_error() == Some(libc::EAGAIN)) {
         source
             .file

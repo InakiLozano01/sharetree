@@ -1,5 +1,3 @@
-//! No-reflink paths: everything must fall back to stock `git worktree add`.
-
 #![cfg(unix)]
 
 mod common;

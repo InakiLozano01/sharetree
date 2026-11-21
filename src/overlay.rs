@@ -1,34 +1,3 @@
-//! Overlay worktrees (Linux, opt-in `sharetree add --overlay`): for
-//! filesystems without reflinks (ext4, tmpfs), per the ext4/NTFS research
-//! note §1.3–1.5 and §7.5.
-//!
-//! * **Lower layer**: an immutable *base* checkout per commit, a detached
-//!   worktree at `$XDG_DATA_HOME/sharetree/overlay/<repo-id>/bases/<commit>`,
-//!   locked so `git gc` never prunes it. The overlay docs forbid changing a
-//!   lower layer while it is mounted, so the base is never the main worktree
-//!   and nothing writes to it.
-//! * **Upper/work dirs** per worktree under `.../wt/<name>/`, on the same
-//!   filesystem as the base, so fuse-overlayfs reports the lower inode
-//!   numbers and git's cached stat data stays valid.
-//! * The worktree's `.git` file is moved into the upper dir, the
-//!   fuse-overlayfs mount goes on the path the user asked for, and the
-//!   worktree's index is **seeded from the base's settled index**: stat data
-//!   match through the overlay (same inode, mtime, ctime, size), so nothing
-//!   is copied up and the first `git status` needs no rehash.
-//! * Each overlay worktree is **locked** (`sharetree overlay: ...`): while
-//!   unmounted its path holds no `.git`, and `git worktree prune` would
-//!   otherwise drop it.
-//! * Mounts do not survive a reboot: `sharetree mount --all` remounts every
-//!   overlay; `add` installs the systemd user unit `sharetree-overlays.service`
-//!   that runs it at login. `sharetree rm` unmounts, deletes upper and work,
-//!   and removes the base once no overlay uses it.
-//!
-//! Costs (research §1.3–1.4): the first write to a file copies the whole file
-//! into the upper dir (even opening it read-write); renaming a directory
-//! from the lower layer copies the tree (EXDEV); reads go through FUSE and
-//! were 3–6x slower than plain ext4 for `git grep`, `find` and `cat`.
-
-// Generators and parsers are portable so their tests run everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::ffi::OsString;
@@ -39,7 +8,6 @@ pub const BASE_LOCK_REASON: &str =
     "sharetree overlay base: read-only lower layer of overlay worktrees; do not edit";
 const BASE_PREPARING_LOCK: &str = "sharetree overlay base: checkout in progress";
 pub const UNIT_NAME: &str = "sharetree-overlays.service";
-/// fuse-overlayfs 1.18 fixed CVE-2026-77478.
 pub const MIN_VERSION: (u32, u32) = (1, 18);
 
 pub fn lock_reason(name: &str) -> String {
@@ -56,7 +24,6 @@ pub fn is_base_lock(reason: Option<&str>) -> bool {
     matches!(reason, Some(BASE_LOCK_REASON | BASE_PREPARING_LOCK))
 }
 
-/// Where a repository's bases and overlay worktrees live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub root: PathBuf,
@@ -82,8 +49,6 @@ impl Layout {
     }
 }
 
-/// Escape a path for a fuse-overlayfs `-o` option value: `,` separates
-/// options and `:` separates lower dirs, both escaped with a backslash.
 pub fn escape_opt(p: &Path) -> String {
     let s = p.to_string_lossy();
     let mut out = String::with_capacity(s.len());
@@ -96,7 +61,6 @@ pub fn escape_opt(p: &Path) -> String {
     out
 }
 
-/// fuse-overlayfs arguments for one worktree.
 pub fn mount_args(lower: &Path, upper: &Path, work: &Path, mountpoint: &Path) -> Vec<OsString> {
     vec![
         "-o".into(),
@@ -111,7 +75,6 @@ pub fn mount_args(lower: &Path, upper: &Path, work: &Path, mountpoint: &Path) ->
     ]
 }
 
-/// Parse `fuse-overlayfs --version` ("fuse-overlayfs: version 1.18").
 pub fn parse_version(out: &str) -> Option<(u32, u32)> {
     let v = out
         .lines()
@@ -142,7 +105,6 @@ fn validate_fuse_version(success: bool, text: &str) -> Result<(), String> {
     }
 }
 
-/// systemd user unit that remounts every overlay worktree at login.
 pub fn systemd_unit(exe: &Path, config: &Path) -> String {
     let mut env_q = String::from("\"");
     for c in format!("SHARETREE_CONFIG={}", config.display()).chars() {
@@ -225,7 +187,6 @@ mod linux {
         Ok(bin)
     }
 
-    /// fuse-overlayfs, fusermount3 and /dev/fuse, or why not.
     fn prerequisites() -> Result<()> {
         fuse_overlayfs()?;
         if volume::find_in_path("fusermount3").is_none() {
@@ -325,8 +286,6 @@ mod linux {
         bail!("{} is still mounted after `fusermount3 -u`", path.display())
     }
 
-    /// Delete a tree that may contain the kernel's or fuse's `d---------`
-    /// work directories (research §1.5): make everything writable first.
     fn remove_tree(p: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fn walk(p: &Path) {
@@ -346,13 +305,8 @@ mod linux {
         }
     }
 
-    /// Wait until the wall clock is past every file just written, then let
-    /// git refresh the base's index. Entries are then older than the index,
-    /// so git never treats them as racily clean, and a copy of this index is
-    /// stat-valid for every overlay on the base.
     fn settle_index(base: &Path) -> Result<()> {
         let newest = SystemTime::now();
-        // git compares whole seconds unless built with USE_NSEC.
         let secs = newest
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -391,9 +345,6 @@ mod linux {
         Ok(lock)
     }
 
-    /// A base for `commit`: the exact one if it exists, else the existing
-    /// base whose tree differs least when that is under 5 % of the files
-    /// (git then writes the differences into the upper dir), else a new one.
     fn ensure_base(
         cwd: &Path,
         layout: &Layout,
@@ -550,7 +501,6 @@ mod linux {
         }
     }
 
-    /// `sharetree add --overlay ...`
     pub fn add(a: &AddArgs) -> Result<(i32, PathBuf)> {
         if let Some(var) = git::context_override() {
             bail!("--overlay requires Git to discover each worktree from its path; unset {var}");
@@ -779,8 +729,6 @@ mod linux {
         if let Some(admin) = crate::rm::registered_admin(&entry.common_dir, &entry.path)? {
             let has_checkout_at_mountpoint =
                 crate::rm::admin_dir(&entry.path).is_ok_and(|a| same_path(&a, &admin));
-            // A Git worktree registered at the old mountpoint after our
-            // unregistration still has its .git file on the host directory.
             if entry.phase == OverlayPhase::Creating && has_checkout_at_mountpoint {
                 fs::remove_file(entry.path.join(".git"))?;
             }
@@ -835,7 +783,6 @@ mod linux {
         }
     }
 
-    /// A base may still be shared by active or interrupted overlays.
     pub fn lock_unused_base(path: &Path) -> Result<fs::File> {
         let lock = lifecycle_lock()?;
         if Config::load()?
@@ -851,8 +798,6 @@ mod linux {
         Ok(lock)
     }
 
-    /// Remove configured overlays, including interrupted removals whose Git
-    /// registration has already gone away.
     pub fn remove(
         cwd: &Path,
         common: &Path,
@@ -920,7 +865,6 @@ mod linux {
         Ok(Some(0))
     }
 
-    /// `sharetree mount [--all] [--unmount] [<path>...]`
     pub fn run_mount(args: &[OsString]) -> Result<i32> {
         let mut all = false;
         let mut un = false;

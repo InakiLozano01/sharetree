@@ -1,6 +1,3 @@
-//! Copy-on-write cloning. The platform adapters supply their native clone
-//! operation, while this module owns file lifetime and tracked donor checks.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -18,11 +15,8 @@ pub use platform::{is_plain_file, open_no_follow};
 
 #[derive(Debug)]
 pub enum CloneError {
-    /// The filesystem (or this file pair) cannot share extents.
     Unsupported(io::Error),
-    /// The donor changed while it was cloned, or is not what the plan expected.
     SourceChanged,
-    /// Any other failure (missing donor, permissions, ENOSPC...).
     Io(io::Error),
 }
 
@@ -36,8 +30,6 @@ impl std::fmt::Display for CloneError {
     }
 }
 
-/// A file created by this operation. Close its handle before removing it so
-/// the same cleanup works on Windows and Unix.
 struct PendingFile<'a> {
     path: &'a Path,
     file: Option<File>,
@@ -71,9 +63,6 @@ impl Drop for PendingFile<'_> {
     }
 }
 
-/// Clone a regular donor of `want_size` bytes. Re-stat the same open donor
-/// after the clone and retain the destination only if the stamp still matches.
-/// The caller verifies content by hashing the clone.
 pub fn clone_tracked(
     src: &Path,
     dst: &Path,
@@ -94,8 +83,6 @@ pub fn clone_tracked(
     Ok(())
 }
 
-/// Prove that the destination filesystem can clone, including reading back
-/// the clone's bytes. Files are removed only after successful creation.
 pub fn probe(dir: &Path) -> Result<(), String> {
     let tag = format!(
         ".sharetree-probe-{}-{}",

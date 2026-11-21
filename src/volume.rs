@@ -1,20 +1,3 @@
-//! sharetree volumes: a copy-on-write filesystem inside a file, for hosts whose
-//! own filesystem cannot share blocks (research note §2, §7.3).
-//!
-//! * Linux: a sparse, user-owned Btrfs (or XFS `reflink=1`) image, attached
-//!   with `udisksctl loop-setup` and mounted with `udisksctl mount`. Polkit
-//!   allows both for the active desktop session, so no root is needed;
-//!   otherwise the user adds a root-once fstab line.
-//! * Windows: a ReFS Dev Drive VHDX (see `devdrive.rs`).
-//!
-//! Worktrees placed in a volume live under `<mount>/<repo-id>/`. A reflink
-//! cannot cross filesystems, so each repository gets a **seed**: a detached
-//! worktree at `<mount>/<repo-id>/.sharetree-seed`, created once with a plain
-//! checkout, locked, and advanced to the target commit before each add. It
-//! is the donor for every later worktree in the volume.
-
-// The mountinfo parser and unit/fstab generators are Linux-only at run
-// time but stay portable so their tests run everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
@@ -22,8 +5,6 @@ use std::path::{Path, PathBuf};
 use crate::config::{MountMethod, Volume, VolumeKind};
 
 pub const SEED_DIR: &str = ".sharetree-seed";
-/// Lock reasons sharetree writes. Worktrees in a volume are locked so that
-/// `git gc` (worktree prune) keeps them while the volume is unmounted.
 pub const VOLUME_LOCK_PREFIX: &str = "sharetree volume";
 pub const SEED_LOCK_REASON: &str =
     "sharetree seed: donor checkout for worktrees in this volume; do not edit";
@@ -42,8 +23,6 @@ pub fn is_seed_lock(reason: Option<&str>) -> bool {
     reason.is_some_and(|r| r == SEED_LOCK_REASON)
 }
 
-/// Stable directory name for a repository inside a volume: the main
-/// worktree's name plus a hash of its git common dir.
 pub fn repo_id(common_dir: &Path, main_worktree: &Path) -> String {
     use sha2::{Digest, Sha256};
     let base: String = main_worktree
@@ -65,7 +44,6 @@ pub fn repo_id(common_dir: &Path, main_worktree: &Path) -> String {
     format!("{}-{hex}", if base.is_empty() { "repo" } else { base })
 }
 
-/// `dir/name`, or `dir/name-2`, `dir/name-3`... whichever does not exist.
 pub fn unique_child(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if first.symlink_metadata().is_err() {
@@ -77,7 +55,6 @@ pub fn unique_child(dir: &Path, name: &str) -> PathBuf {
         .expect("unbounded")
 }
 
-/// Where worktrees go inside a mounted volume.
 pub fn worktrees_root(v: &Volume, mountpoint: &Path) -> PathBuf {
     match v.kind {
         VolumeKind::Devdrive => mountpoint.join("sharetree"),
@@ -91,7 +68,6 @@ pub enum State {
         mountpoint: PathBuf,
         device: Option<String>,
     },
-    /// Loop device attached, filesystem not mounted.
     Attached {
         device: String,
     },
@@ -108,9 +84,6 @@ impl State {
     }
 }
 
-// ---------------------------------------------------------------------------
-// /proc/self/mountinfo (portable parser, used on Linux)
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountEntry {
     pub root: String,
@@ -119,7 +92,6 @@ pub struct MountEntry {
     pub source: String,
 }
 
-/// Undo mountinfo's octal escapes (`\040` for a space, etc.).
 fn unescape(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -160,11 +132,6 @@ fn parse_mountinfo_bytes(text: &[u8]) -> Vec<MountEntry> {
     v
 }
 
-// ---------------------------------------------------------------------------
-// Generated text (portable, unit-tested)
-
-/// Quote one ExecStart argument for systemd (double quotes; `%` and `$`
-/// are specifier / variable characters and must be doubled).
 pub fn systemd_quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -199,12 +166,6 @@ pub fn unit_name(volume: &str) -> String {
     format!("sharetree-volume-{safe}.service")
 }
 
-/// systemd user unit that attaches and mounts the volume at login. polkit
-/// grants udisks loop-setup/mount to a user service through the user's
-/// active session (checked with pkcheck from a `systemd-run --user` unit);
-/// the restart covers logins where the session is not active yet.
-/// `config` is baked in as SHARETREE_CONFIG so the unit reads the same config
-/// file as the `sharetree` that installed it.
 pub fn systemd_unit(exe: &Path, v: &Volume, config: &Path) -> String {
     let env = format!("SHARETREE_CONFIG={}", config.display());
     let mut env_q = String::from("\"");
@@ -245,7 +206,6 @@ pub fn systemd_unit(exe: &Path, v: &Volume, config: &Path) -> String {
     )
 }
 
-/// Escape a path for /etc/fstab (whitespace and backslash as octal).
 pub fn fstab_escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -280,8 +240,6 @@ pub fn fstab_line(v: &Volume, mountpoint: &Path) -> String {
     )
 }
 
-/// What the user runs once, as root, when udisks is not allowed to mount
-/// for them (SSH or headless sessions). sharetree never runs sudo itself.
 pub fn root_once_commands(v: &Volume, mountpoint: &Path) -> String {
     let mp = shell_quote(&mountpoint.display().to_string());
     format!(
@@ -303,15 +261,10 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// mkfs.xfs protofile: the root directory owned by the user (mkfs.xfs(8),
-/// "-p protofile", line 3).
 pub fn xfs_protofile(uid: u32, gid: u32) -> String {
     format!("sharetree\n0 0\nd--755 {uid} {gid}\n$\n")
 }
 
-/// Default image size: 30 % of the free space, capped at 200 GiB, at least
-/// 1 GiB (2 GiB for XFS, whose minimum is 300 MiB plus log), rounded down to
-/// whole GiB. The image is sparse, so the size is a cap, not a cost.
 pub fn default_size(free: u64, kind: VolumeKind) -> u64 {
     const G: u64 = 1 << 30;
     let floor = if kind == VolumeKind::Xfs { 2 * G } else { G };
@@ -327,8 +280,6 @@ pub fn mount_method_desc(m: MountMethod) -> &'static str {
     }
 }
 
-/// Volume state on any platform. A Dev Drive counts as mounted when its
-/// drive root exists.
 pub fn current_state(v: &Volume) -> State {
     try_current_state(v).unwrap_or(State::Detached)
 }
@@ -356,7 +307,6 @@ pub fn try_current_state(v: &Volume) -> anyhow::Result<State> {
     }
 }
 
-/// Mount the volume if needed (Linux: udisks), returning its mountpoint.
 pub fn mount_any(v: &Volume, quiet: bool) -> anyhow::Result<PathBuf> {
     if v.kind != VolumeKind::Devdrive && !v.image.try_exists()? {
         anyhow::bail!(
@@ -387,17 +337,14 @@ pub fn mount_any(v: &Volume, quiet: bool) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Recognize an existing image by its superblock magic, to re-adopt it.
 pub fn image_kind(path: &Path) -> Option<VolumeKind> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let mut b = [0u8; 8];
-    // XFS: "XFSB" at offset 0.
     f.read_exact(&mut b[..4]).ok()?;
     if &b[..4] == b"XFSB" {
         return Some(VolumeKind::Xfs);
     }
-    // Btrfs: "_BHRfS_M" at 0x10040 (superblock at 64 KiB, magic at +0x40).
     f.seek(SeekFrom::Start(0x10040)).ok()?;
     f.read_exact(&mut b).ok()?;
     (&b == b"_BHRfS_M").then_some(VolumeKind::Btrfs)
@@ -421,7 +368,6 @@ mod linux {
     use crate::config::{MountMethod, Volume, VolumeKind};
     use crate::util::canon;
 
-    /// Loop devices whose backing file is `image`.
     fn loop_devices_for(image: &Path, image_exists: bool) -> Result<Vec<String>> {
         let want = canon(image);
         let mut devices = Vec::new();
@@ -487,7 +433,6 @@ mod linux {
     }
 
     fn observed_attachment(devices: Vec<String>, mounts: &[MountEntry]) -> State {
-        // Prefer the filesystem root (a Btrfs subvolume mount has root != /).
         if let Some(m) = mounts
             .iter()
             .filter(|m| devices.contains(&m.source))
@@ -511,7 +456,6 @@ mod linux {
             .find(|p| p.is_file())
     }
 
-    /// polkit's verdict for this process (None: pkcheck is not installed).
     pub fn polkit_allows(action: &str) -> Option<bool> {
         find_in_path("pkcheck")?;
         let st = Command::new("pkcheck")
@@ -525,7 +469,6 @@ mod linux {
         Some(st.success())
     }
 
-    /// Can this session attach and mount without a password?
     pub fn udisks_usable() -> Result<(), String> {
         if find_in_path("udisksctl").is_none() {
             return Err("udisksctl is not installed (package udisks2)".into());
@@ -595,7 +538,6 @@ mod linux {
         )
     }
 
-    /// Attach and mount the volume if needed; returns the mountpoint.
     pub fn ensure_mounted(v: &Volume, quiet: bool) -> Result<PathBuf> {
         let lockpath = crate::config::config_path()
             .context("cannot locate a config directory (set HOME or XDG_CONFIG_HOME)")?
@@ -665,12 +607,10 @@ mod linux {
                 }
             }
         };
-        // A desktop automounter (udiskie, GNOME, KDE) may mount it for us.
         if let Some(mp) = wait_mounted(v, Duration::from_millis(1500))? {
             return Ok(mp);
         }
         if let Err(e) = udisks_device("mount", &dev) {
-            // Lost a race with an automounter?
             if let Some(mp) = wait_mounted(v, Duration::from_secs(2))? {
                 return Ok(mp);
             }
@@ -684,7 +624,6 @@ mod linux {
         Ok(mp)
     }
 
-    /// Unmount and detach, checking that each observed transition made progress.
     pub fn unmount(v: &Volume) -> Result<()> {
         let mut state = observe_state(v)?;
         let mut seen = Vec::new();
@@ -720,8 +659,6 @@ mod linux {
         }
     }
 
-    /// Create a sparse image file; NOCOW on a Btrfs host (VM-image advice:
-    /// a CoW image file on CoW Btrfs fragments badly).
     pub fn create_image(path: &Path, size: u64) -> Result<()> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
@@ -739,7 +676,6 @@ mod linux {
             const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
             const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
             let mut flags: libc::c_int = 0;
-            // SAFETY: valid fd and out-pointer of the size the kernel writes.
             unsafe {
                 if libc::ioctl(f.as_raw_fd(), FS_IOC_GETFLAGS as _, &mut flags) == 0 {
                     flags |= FS_NOCOW_FL;
@@ -752,7 +688,6 @@ mod linux {
         Ok(())
     }
 
-    /// Format the image with the root directory owned by the user.
     pub fn mkfs(v: &Volume) -> Result<()> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -799,18 +734,15 @@ mod linux {
         res
     }
 
-    /// Free bytes for an unprivileged user on the filesystem holding `p`.
     pub fn free_bytes(p: &Path) -> Option<u64> {
         let (_, avail) = statvfs(p)?;
         Some(avail)
     }
 
-    /// (total, available) bytes.
     pub fn statvfs(p: &Path) -> Option<(u64, u64)> {
         use std::os::unix::ffi::OsStrExt;
         let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: valid C string and out-pointer.
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
@@ -818,8 +750,6 @@ mod linux {
         Some((st.f_blocks as u64 * f, st.f_bavail as u64 * f))
     }
 
-    /// Btrfs bytes still waiting for async discard to punch holes in the
-    /// image (`/sys/fs/btrfs/<fsid>/discard/discardable_bytes`).
     pub fn btrfs_discardable(device: &str) -> Option<u64> {
         let name = device.strip_prefix("/dev/")?;
         for e in fs::read_dir("/sys/fs/btrfs").ok()?.flatten() {

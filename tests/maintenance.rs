@@ -1,5 +1,3 @@
-//! `rm`, `ls`, `du`.
-
 #![cfg(unix)]
 
 mod common;
@@ -15,19 +13,16 @@ fn rm_checks_like_git_then_parks_and_sweeps() {
     let wt = sb.p("wt");
     sb.sharetree_ok(&main, &["add", "-b", "topic", &wt.to_string_lossy()]);
 
-    // Dirty: refused without --force.
     write(&wt.join("scratch.txt"), b"wip");
     let out = sb.sharetree(&main, &["rm", &wt.to_string_lossy()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
     assert!(wt.exists());
 
-    // cwd inside: refused even with --force.
     let out = sb.sharetree(&wt.join("src"), &["rm", "-f", &wt.to_string_lossy()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("current directory"));
 
-    // Main worktree: refused.
     assert!(!sb
         .sharetree(&wt, &["rm", "-f", &main.to_string_lossy()])
         .status
@@ -38,16 +33,13 @@ fn rm_checks_like_git_then_parks_and_sweeps() {
     assert!(!sb
         .git(&main, &["worktree", "list", "--porcelain"])
         .contains(&*wt.to_string_lossy()));
-    // The branch survives, as with `git worktree remove`.
     sb.git(&main, &["rev-parse", "--verify", "topic"]);
-    // The background sweep empties the trash.
     let trash = main.join(".git/sharetree-trash");
     let t = Instant::now();
     while trash.exists() && t.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!trash.exists(), "trash not swept");
-    // The name is free again.
     sb.sharetree_ok(&main, &["add", "--detach", &wt.to_string_lossy()]);
 }
 
@@ -161,7 +153,6 @@ fn ls_and_du_report_exclusive_bytes() {
             .to_string()
     };
     if fs_type(sb.root()) == "btrfs" && btrfs_exclusive(&[sb.p("cow")]).is_some() {
-        // ~330 KiB of tracked data: the stock tree owns it, the cow one does not.
         assert!(
             row("cow").trim_start().starts_with("0 B") || row("cow").contains(" KiB"),
             "{}",

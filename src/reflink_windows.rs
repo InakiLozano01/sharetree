@@ -1,5 +1,3 @@
-//! Windows adapter for the native clone operation in `winclone.rs`.
-
 use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -17,8 +15,6 @@ pub(super) const PROBE_LEN: usize = 65536;
 pub use winclone::is_plain_file;
 pub(super) use winclone::open_source;
 
-// ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION, ERROR_NOT_SAME_DEVICE,
-// ERROR_INVALID_PARAMETER: the volume or file pair cannot clone.
 fn classify(e: io::Error) -> CloneError {
     match e.raw_os_error() {
         Some(50 | 1 | 17 | 87) => CloneError::Unsupported(e),
@@ -61,7 +57,6 @@ pub(super) fn probe_clone<'a>(
     source: &mut PendingFile<'_>,
     dst: &'a Path,
 ) -> Result<PendingFile<'a>, String> {
-    // The donor handle opened for cloning denies other writers.
     source.close();
     let src = open_source(source.path).map_err(|e| e.to_string())?;
     if !winclone::volume_can_clone(&src).map_err(|e| e.to_string())? {

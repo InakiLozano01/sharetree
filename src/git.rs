@@ -1,7 +1,3 @@
-//! Thin wrappers around the `git` executable. sharetree reimplements only
-//! two small pieces of git: the v2 index writer (`index.rs`) and blob
-//! hashing (`hash.rs`).
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -15,8 +11,6 @@ use crate::util::bytes_to_path;
 pub const MODE_REGULAR: u32 = 0o100644;
 pub const MODE_EXEC: u32 = 0o100755;
 
-/// These overrides can make changing the subprocess directory insufficient
-/// to select the intended worktree, or change what our Git queries see.
 pub(crate) fn context_override() -> Option<&'static str> {
     [
         "GIT_DIR",
@@ -40,8 +34,6 @@ pub fn cmd(dir: &Path) -> Command {
     c
 }
 
-/// A read-only git invocation: never takes optional locks (so `status` and
-/// friends do not rewrite a donor's index behind its owner's back).
 pub fn read_cmd(dir: &Path) -> Command {
     let mut c = cmd(dir);
     c.env("GIT_OPTIONAL_LOCKS", "0");
@@ -55,7 +47,6 @@ fn describe<S: AsRef<OsStr>>(args: &[S]) -> String {
         .join(" ")
 }
 
-/// Run git, capture stdout, fail with git's stderr on a non-zero exit.
 pub fn output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>> {
     let out = read_cmd(dir)
         .args(args)
@@ -79,8 +70,6 @@ pub fn output_str<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String> {
         .to_string())
 }
 
-/// Run git with `input` on stdin (written from a separate thread so a large
-/// input cannot deadlock against a large output).
 pub fn output_with_input<S: AsRef<OsStr>>(dir: &Path, args: &[S], input: &[u8]) -> Result<Vec<u8>> {
     let mut child = read_cmd(dir)
         .args(args)
@@ -106,12 +95,10 @@ pub fn output_with_input<S: AsRef<OsStr>>(dir: &Path, args: &[S], input: &[u8]) 
     Ok(out.stdout)
 }
 
-/// Run git with inherited stdio (the user sees git's own messages).
 pub fn run_inherit<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<ExitStatus> {
     cmd(dir).args(args).status().context("failed to run git")
 }
 
-/// Run git quietly and report whether it succeeded.
 pub fn succeeds<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> bool {
     read_cmd(dir)
         .args(args)
@@ -165,8 +152,6 @@ pub fn trim_nl(b: &[u8]) -> &[u8] {
     &b[..end]
 }
 
-/// A Git config value, preserving its whitespace and distinguishing unset
-/// (exit 1) from a present empty value.
 pub fn config_get(dir: &Path, key: &str) -> Result<Option<String>> {
     let out = read_cmd(dir)
         .args(["config", "-z", "--get", key])
@@ -228,9 +213,6 @@ pub fn object_format(dir: &Path) -> Result<ObjectFormat> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Worktrees
-
 #[derive(Clone, Debug, Default)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -249,8 +231,6 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&out))
 }
 
-/// Parse `git worktree list --porcelain -z`: NUL-terminated fields, records
-/// separated by an empty field. Paths are kept as raw bytes.
 pub fn parse_worktrees(out: &[u8]) -> Vec<Worktree> {
     let mut wts = Vec::new();
     let mut cur: Option<Worktree> = None;
@@ -294,9 +274,6 @@ pub fn parse_worktrees(out: &[u8]) -> Vec<Worktree> {
     wts
 }
 
-// ---------------------------------------------------------------------------
-// Trees
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub mode: u32,
@@ -310,7 +287,6 @@ impl Entry {
     }
 }
 
-/// Every blob and gitlink of a commit, keyed by raw path bytes.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
     pub entries: HashMap<Vec<u8>, Entry>,
@@ -322,7 +298,6 @@ impl Tree {
     }
 }
 
-/// `git ls-tree -r -l -z <rev>`: "<mode> SP <type> SP <oid> SP+ <size> TAB <path>".
 pub fn ls_tree(dir: &Path, rev: &str) -> Result<Tree> {
     let out = output(dir, &["ls-tree", "-r", "-l", "-z", rev])?;
     parse_ls_tree(&out)
@@ -362,7 +337,6 @@ pub fn parse_ls_tree(out: &[u8]) -> Result<Tree> {
     Ok(tree)
 }
 
-/// Stage-0 entries of a worktree's index: `git ls-files -s -z`.
 pub fn ls_files_stage(dir: &Path) -> Result<Vec<(Vec<u8>, u32, String)>> {
     let out = output(dir, &["ls-files", "-s", "-z"])?;
     let mut v = Vec::new();
@@ -389,7 +363,6 @@ pub fn ls_files_stage(dir: &Path) -> Result<Vec<(Vec<u8>, u32, String)>> {
     Ok(v)
 }
 
-/// Split NUL-terminated output into owned records.
 pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
     out.split(|&b| b == 0)
         .filter(|r| !r.is_empty())
@@ -397,7 +370,6 @@ pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Whether Git can run this hook from the repository.
 pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
     let hook = git_path(worktree, &format!("hooks/{name}"))?;
     let Ok(md) = hook.metadata() else {

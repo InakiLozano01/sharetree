@@ -1,35 +1,3 @@
-//! User configuration: `$XDG_CONFIG_HOME/sharetree/config.toml` (Windows:
-//! `%APPDATA%\sharetree\config.toml`; `SHARETREE_CONFIG` overrides the path).
-//!
-//! ```toml
-//! auto_volume = false          # place worktrees in the volume when the
-//!                              # destination cannot reflink; unset: ask
-//!
-//! [[volume]]
-//! name = "default"
-//! kind = "btrfs"               # btrfs | xfs | devdrive
-//! image = "/home/me/.local/share/sharetree/volume.img"
-//! label = "sharetree"
-//! size = 107374182400
-//! mount = "udisks"             # udisks | fstab | devdrive
-//! mountpoint = "/run/media/me/sharetree"   # last seen (fstab: fixed)
-//! unit = "sharetree-volume-default.service"
-//!
-//! windows_clone = false        # Windows: ReFS block cloning (experimental)
-//!
-//! [[repo]]
-//! common_dir = "/home/me/src/app/.git"
-//! volume = "default"           # optional; default: the only volume
-//! auto_volume = true           # optional; overrides the global flag
-//!
-//! [[overlay]]                  # written by `sharetree add --overlay`
-//! path = "/home/me/src/app-fix"
-//! common_dir = "/home/me/src/app/.git"
-//! lower = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/bases/<commit>"
-//! upper = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/wt/app-fix/upper"
-//! work = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/wt/app-fix/work"
-//! ```
-
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,15 +23,11 @@ impl VolumeKind {
     }
 }
 
-/// How the volume gets attached and mounted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MountMethod {
-    /// `udisksctl loop-setup` + `udisksctl mount`, no root (polkit).
     Udisks,
-    /// A root-owned fstab line the user added once.
     Fstab,
-    /// Windows: VHDX attached by a scheduled task.
     Devdrive,
 }
 
@@ -91,8 +55,6 @@ pub struct RepoConfig {
     pub auto_volume: Option<bool>,
 }
 
-/// An overlay worktree (`sharetree add --overlay`), remounted by
-/// `sharetree mount --all`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OverlayPhase {
@@ -110,10 +72,8 @@ impl OverlayPhase {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OverlayEntry {
-    /// Where the user sees the worktree (the mountpoint).
     pub path: PathBuf,
     pub common_dir: PathBuf,
-    /// The base checkout (lower layer).
     pub lower: PathBuf,
     pub upper: PathBuf,
     pub work: PathBuf,
@@ -123,10 +83,8 @@ pub struct OverlayEntry {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    /// None: not decided yet (`add` asks on a terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_volume: Option<bool>,
-    /// Windows: block-clone on ReFS / Dev Drive (experimental, untested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_clone: Option<bool>,
     #[serde(default, rename = "volume", skip_serializing_if = "Vec::is_empty")]
@@ -148,7 +106,6 @@ fn home() -> Option<PathBuf> {
     env_path("HOME").or_else(|| env_path("USERPROFILE"))
 }
 
-/// Directory holding `config.toml` (and, on Linux, nothing else).
 pub fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         return env_path("APPDATA").map(|p| p.join("sharetree"));
@@ -162,7 +119,6 @@ pub fn config_path() -> Option<PathBuf> {
     env_path("SHARETREE_CONFIG").or_else(|| config_dir().map(|d| d.join("config.toml")))
 }
 
-/// Where sharetree keeps volume images and generated scripts.
 pub fn data_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         return env_path("LOCALAPPDATA").map(|p| p.join("sharetree"));
@@ -172,7 +128,6 @@ pub fn data_dir() -> Option<PathBuf> {
         .map(|p| p.join("sharetree"))
 }
 
-/// systemd user units (`$XDG_CONFIG_HOME/systemd/user`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn systemd_user_dir() -> Option<PathBuf> {
     env_path("XDG_CONFIG_HOME")
@@ -192,7 +147,6 @@ impl Config {
         ))
     }
 
-    /// The config file, or an empty config when there is none.
     pub fn load() -> Result<Config> {
         let Some(p) = config_path() else {
             return Ok(Config::default());
@@ -261,8 +215,6 @@ impl Config {
         self.repos.last_mut().expect("just pushed")
     }
 
-    /// The volume a repository uses: the one its `[[repo]]` entry names, or
-    /// else the only volume configured (volumes are per user, not per repo).
     pub fn volume_for(&self, common_dir: &Path) -> Option<&Volume> {
         match self.repo(common_dir).and_then(|r| r.volume.as_deref()) {
             Some(name) => self.volume(name),
@@ -271,9 +223,6 @@ impl Config {
         }
     }
 
-    /// Whether worktrees of this repository go into its volume automatically
-    /// when the destination cannot reflink: the repository's own setting,
-    /// else the global one, else None (the user has not chosen yet).
     pub fn auto_volume_for(&self, common_dir: &Path) -> Option<bool> {
         self.repo(common_dir)
             .and_then(|r| r.auto_volume)
@@ -323,7 +272,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a == b || crate::util::canon(a) == crate::util::canon(b)
 }
 
-/// Parse a size such as `100G`, `512M`, `1.5T` or plain bytes (binary units).
 pub fn parse_size(s: &str) -> Result<u64> {
     let t = s.trim();
     let t = t

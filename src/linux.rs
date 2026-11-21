@@ -1,14 +1,7 @@
-//! Linux-only ioctls: FIEMAP (is an extent shared?) and FIDEDUPERANGE
-//! (share identical bytes after the fact, compared by the kernel).
-//!
-//! The FIDEDUPERANGE loop follows the layout and 16 MiB chunking of
-//! leostera/git-twig `sharing.rs` (MIT, see THIRD_PARTY_NOTICES).
-
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
-// include/uapi/linux/fiemap.h
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FiemapExtent {
@@ -38,7 +31,6 @@ const _: () = {
     assert!(std::mem::offset_of!(Fiemap, extents) == 32);
 };
 
-// _IOWR('f', 11, struct fiemap)
 const FS_IOC_FIEMAP: u64 = 0xC020_660B;
 const FIEMAP_FLAG_SYNC: u32 = 0x1;
 const FIEMAP_EXTENT_LAST: u32 = 0x1;
@@ -58,8 +50,6 @@ impl Extent {
     }
 }
 
-/// All extents of `f`. `sync` flushes delayed allocation first, so freshly
-/// written data shows its real extents.
 pub fn extents(f: &File, sync: bool) -> io::Result<Vec<Extent>> {
     let mut out = Vec::new();
     let mut start = 0u64;
@@ -73,7 +63,6 @@ pub fn extents(f: &File, sync: bool) -> io::Result<Vec<Extent>> {
             reserved: 0,
             extents: [FiemapExtent::default(); BATCH],
         };
-        // SAFETY: `req` has the UAPI layout with room for BATCH extents.
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FIEMAP as _, &mut req) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -124,7 +113,6 @@ const _: () = {
     assert!(std::mem::offset_of!(DedupeRange, info) == 24);
 };
 
-// _IOWR(0x94, 54, struct file_dedupe_range)
 const FIDEDUPERANGE: u64 = 0xC018_9436;
 const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
 const CHUNK: u64 = 16 * 1024 * 1024;
@@ -135,10 +123,6 @@ pub enum DedupeOutcome {
     Differs,
 }
 
-/// Make `dst`'s first `len` bytes share `src`'s extents. The kernel locks
-/// both ranges and compares them byte for byte; if they differ nothing
-/// changes. `dst`'s inode, mtime and ctime are left alone, so a git index
-/// entry for it stays valid.
 pub fn dedupe(src: &File, dst: &File, len: u64) -> io::Result<DedupeOutcome> {
     let mut offset = 0u64;
     while offset < len {
@@ -157,7 +141,6 @@ pub fn dedupe(src: &File, dst: &File, len: u64) -> io::Result<DedupeOutcome> {
                 reserved: 0,
             },
         };
-        // SAFETY: UAPI layout with exactly one info entry; fds outlive the call.
         let rc = unsafe { libc::ioctl(src.as_raw_fd(), FIDEDUPERANGE as _, &mut r) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -176,14 +159,12 @@ pub fn dedupe(src: &File, dst: &File, len: u64) -> io::Result<DedupeOutcome> {
     Ok(DedupeOutcome::Deduped(offset))
 }
 
-// statfs(2) magic numbers.
 pub const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 
 pub fn fs_magic(path: &std::path::Path) -> Option<i64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: valid C string and out-pointer.
     let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
     (rc == 0).then_some(st.f_type as i64)
 }

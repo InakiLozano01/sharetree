@@ -1,16 +1,3 @@
-//! Worktree listings and space accounting (`sharetree ls` and `du`).
-//!
-//! `du` sums each file's allocated blocks and cannot see that extents are
-//! shared, so N reflinked worktrees look like N full copies. What matters is
-//! *exclusive* bytes: the space that deleting the worktree would free.
-//!
-//! * Btrfs: `btrfs filesystem du -s` reports Total / Exclusive per path.
-//! * Other Linux filesystems with FIEMAP (XFS reflink=1, ...): the sum of
-//!   extents not flagged SHARED, an estimate (logical lengths; an extent
-//!   shared with a snapshot or with another file in the same tree counts as
-//!   shared).
-//! * Elsewhere: not measurable here; use a `df` delta on an idle volume.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -20,9 +7,7 @@ use crate::git::{self, Worktree};
 use crate::util::human;
 
 struct Usage {
-    /// What `du` would say: allocated blocks, shared or not.
     apparent: u64,
-    /// Bytes only this worktree holds, if measurable.
     exclusive: Option<Exclusive>,
 }
 
@@ -31,7 +16,6 @@ struct Exclusive {
     method: &'static str,
 }
 
-/// Top-level entries of a worktree, minus its `.git`.
 fn top_entries(root: &Path) -> Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(root)?
         .filter_map(|e| e.ok())
@@ -42,7 +26,6 @@ fn top_entries(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(v)
 }
 
-/// Sum of allocated bytes under `p` (like `du -s`), not following symlinks.
 fn allocated(p: &Path) -> u64 {
     let Ok(md) = p.symlink_metadata() else {
         return 0;
@@ -91,7 +74,6 @@ fn btrfs_exclusive(entries: &[PathBuf]) -> Option<u64> {
     parse_btrfs_du(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Sum the Exclusive column of `btrfs filesystem du -s --raw`.
 #[cfg(any(target_os = "linux", test))]
 fn parse_btrfs_du(text: &str) -> Option<u64> {
     let mut sum = 0u64;

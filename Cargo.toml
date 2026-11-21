@@ -19,7 +19,6 @@ path = "src/lib.rs"
 name = "sharetree"
 path = "src/main.rs"
 
-# Same program under the name git looks for, so `git sharetree add ...` works.
 [[bin]]
 name = "git-sharetree"
 path = "src/bin/git-sharetree.rs"

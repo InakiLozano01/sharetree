@@ -1,14 +1,3 @@
-//! Minimal git index (version 2, no extensions) writer.
-//!
-//! Ported from josharian/git-cow-worktree `index.go` (MIT, see
-//! THIRD_PARTY_NOTICES). The index exists for exactly one reader: the
-//! `git checkout -f HEAD` that follows. Git decides whether to rewrite a
-//! working-tree file by comparing it against the cached stat data of its
-//! index entry, so without this index the checkout would rewrite every file
-//! we just cloned and undo the sharing. Entries we omit are not lost:
-//! checkout builds the real index from the target tree and writes anything
-//! missing here.
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -35,7 +24,6 @@ struct Stat {
 
 #[cfg(unix)]
 impl Stat {
-    /// The fields git stores, truncated to 32 bits exactly as git does.
     fn from_metadata(m: &std::fs::Metadata) -> Stat {
         use std::os::unix::fs::MetadataExt;
         Stat {
@@ -54,7 +42,6 @@ impl Stat {
 
 #[cfg(windows)]
 impl Stat {
-    /// What Git for Windows' `mingw_lstat` reports.
     fn from_metadata(m: &std::fs::Metadata) -> Stat {
         use std::os::windows::fs::MetadataExt;
         Stat::from_windows_times(m.creation_time(), m.last_write_time(), m.file_size())
@@ -66,8 +53,6 @@ const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
 
 #[cfg(any(windows, test))]
 fn filetime_to_unix(ft: u64) -> (i64, u32) {
-    // Git's compatibility layer uses creation and last-write times, both
-    // in 100 ns intervals since the FILETIME epoch of 1601-01-01.
     let t = ft as i64 - EPOCH_DIFF_100NS;
     (
         t.div_euclid(10_000_000),
@@ -105,8 +90,6 @@ pub struct VerifiedClone {
     size: u64,
 }
 
-/// Hash the bytes of a newly created clone against the target blob. A clone
-/// that fails verification is removed so Git can write the path itself.
 #[cfg(any(unix, windows))]
 pub fn verify_clone(
     worktree: &Path,
@@ -162,8 +145,6 @@ pub struct SeededIndex {
     pub bytes: u64,
 }
 
-/// Recheck each verified clone and write the fresh worktree's index with
-/// only the files Git can keep. Git creates its own index if none qualify.
 #[cfg(any(unix, windows))]
 pub fn seed_worktree(
     worktree: &Path,
@@ -193,9 +174,7 @@ pub fn seed_worktree(
 
 const NAME_MASK: usize = 0x0fff;
 
-/// Serialize `entries` (any order) as a v2 index with a trailing checksum.
 fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> {
-    // Git requires entries sorted by raw path bytes (stage 0 only here).
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     for w in entries.windows(2) {
         if w[0].path == w[1].path {
@@ -228,7 +207,6 @@ fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> {
         let flags = e.path.len().min(NAME_MASK) as u16;
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&e.path);
-        // At least one NUL, then pad the entry to a multiple of 8 bytes.
         buf.push(0);
         while (buf.len() - start) % 8 != 0 {
             buf.push(0);
@@ -247,9 +225,6 @@ fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Write the index through `index.lock` + rename, as git does, so a
-/// concurrent git process fails loudly instead of racing us and a partial
-/// write can never become the index.
 fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<()> {
     let data = encode(entries, fmt)?;
     let mut lock = path.as_os_str().to_owned();
@@ -260,12 +235,7 @@ fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<(
         .create_new(true)
         .open(&lock)
         .with_context(|| format!("create {}", lock.display()))?;
-    // No fsync, like git's own index writes: the next command reads it at
-    // once, and on Btrfs an fsync here waits for the transaction holding
-    // every clone we just made (1.4 s on a kernel tree).
     let res = (|| -> Result<()> {
-        // A concurrent Git command could have created the index before we
-        // took its lock. This partial index is only for a fresh worktree.
         match fs::symlink_metadata(path) {
             Ok(_) => bail!("{} already exists", path.display()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -319,7 +289,6 @@ mod tests {
         let data = encode(&mut v, ObjectFormat::Sha1).unwrap();
         assert_eq!(&data[..4], b"DIRC");
         assert_eq!(u32::from_be_bytes(data[8..12].try_into().unwrap()), 2);
-        // 62-byte fixed part + 3-byte name + NUL padding to 72.
         assert_eq!(&data[12 + 62..12 + 65], b"a/c");
         assert_eq!((data.len() - 12 - 20) % 8, 0);
         let body = &data[..data.len() - 20];

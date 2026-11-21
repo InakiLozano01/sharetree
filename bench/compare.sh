@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# Alternate several ways of creating a worktree and print each run's wall time.
-#
-#   bench/compare.sh <repo> <rounds> <label>=<command>...
-#
-# <command> is `git` (stock `git worktree add`) or a sharetree binary,
-# optionally preceded by VAR=value environment settings, e.g.
-#
-#   bench/compare.sh ~/src/linux 5 git=git old=X=1\ /tmp/sharetree-old new=X=1\ target/release/sharetree
-#
-# Each run: sync, sleep $SETTLE (default 3) s, add a detached worktree next to
-# the repo, count `git status` changes (must be 0), remove it. The 1-minute
-# load average is printed with every run, since a busy host skews the times.
 set -euo pipefail
 if (( $# < 3 )) || [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
   echo "usage: $0 <repo> <rounds> <label>=<program>... | --tool <label> <program> [args]..." >&2

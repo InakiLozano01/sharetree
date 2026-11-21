@@ -1,26 +1,3 @@
-//! `sharetree add --warm`: the ignored-cache layer (design §8.4).
-//!
-//! Reflinks ignored paths (node_modules, target/, ...) from the donor so the
-//! first build in the new worktree starts warm. Rules:
-//!
-//! * reflink only; if the filesystem refuses, nothing is copied at all;
-//! * never: directories holding `pyvenv.cfg` or `CMakeCache.txt` (they embed
-//!   absolute paths; oh-my-pi `prune_nonrelocatable_clone_dirs`), `.env*`
-//!   files (secrets), nested repositories/worktrees, other worktrees and the
-//!   destination itself (oh-my-pi "clone holes", lane);
-//! * absolute symlinks that point into the donor are retargeted into the new
-//!   worktree (lane `cow.rs` retarget);
-//! * a `.sharetree.toml` policy narrows what is cloned and adds skips.
-//!
-//! ```toml
-//! [warm]
-//! clone = ["node_modules", "target/release"]  # default: every ignored path
-//! skip  = ["*.log", "target/debug/incremental"]
-//! ```
-//!
-//! A pattern without `/` matches a name at any depth; with `/` it is anchored
-//! at the worktree root. `*` and `?` match within one path component.
-
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -74,7 +51,6 @@ impl Pattern {
         }
     }
 
-    /// Could something below `rel` match?
     fn could_contain(&self, rel: &[&[u8]]) -> bool {
         if !self.anchored {
             return true;
@@ -83,7 +59,6 @@ impl Pattern {
     }
 }
 
-/// `*` and `?` within one path component.
 fn glob(p: &[u8], s: &[u8]) -> bool {
     let (mut pi, mut si) = (0, 0);
     let (mut star, mut mark) = (None, 0);
@@ -200,7 +175,6 @@ impl Ctx<'_> {
         result
     }
 
-    /// Reasons a path is never cloned, checked at every depth.
     fn veto(&self, rel: &[u8], src: &Path, md: &fs::Metadata) -> Option<&'static str> {
         let cs = comps(rel);
         let canon = util::canon(src);
@@ -237,7 +211,6 @@ impl Ctx<'_> {
             .map(|rel| self.dest.join(rel))
     }
 
-    /// Selection walk: find the paths the policy asks for.
     fn select(&mut self, rel: &[u8], st: &mut Stats) -> Result<(), Abort> {
         let src = self.donor.join(bytes_to_path(rel));
         let Ok(md) = src.symlink_metadata() else {

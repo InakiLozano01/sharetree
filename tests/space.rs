@@ -1,5 +1,3 @@
-//! Write isolation, real space savings (Btrfs), and `reshare`.
-
 #![cfg(unix)]
 
 mod common;
@@ -9,7 +7,6 @@ use std::path::Path;
 
 use common::*;
 
-/// A repo dominated by large files (~16 MiB), so savings are unambiguous.
 fn big_repo(sb: &Sandbox) -> std::path::PathBuf {
     let main = sb.repo("main", &[]);
     for i in 0..16u64 {
@@ -31,12 +28,10 @@ fn writes_do_not_leak_between_worktrees() {
     assert!(reflinked(&err) > 0, "{err}");
     let orig = fs::read(main.join("big.bin")).unwrap();
 
-    // One byte in the new worktree must not reach the donor...
     let mut d = orig.clone();
     d[12345] ^= 1;
     fs::write(cow.join("big.bin"), &d).unwrap();
     assert_eq!(fs::read(main.join("big.bin")).unwrap(), orig);
-    // ...even when written in place through an open descriptor.
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = fs::OpenOptions::new()
@@ -50,10 +45,8 @@ fn writes_do_not_leak_between_worktrees() {
         fs::read(main.join("src/mod2/data2.bin")).unwrap(),
         fs::read(cow.join("src/mod2/data2.bin")).unwrap()
     );
-    // ...and vice versa.
     fs::write(main.join("bin/tool.sh"), b"changed").unwrap();
     assert_eq!(fs::read(cow.join("bin/tool.sh")).unwrap(), bytes(8, 9000));
-    // chmod is per-inode too (a hardlink would share it).
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(
         cow.join("docs/readme.md"),
@@ -99,12 +92,9 @@ fn btrfs_exclusive_bytes_are_near_zero() {
     };
     let cow = exclusive(&sb.p("cow")).unwrap();
     eprintln!("exclusive: stock={stock} cow={cow}\n{err}");
-    // ~16.4 MiB of tracked data. The stock checkout owns all of it; the
-    // copy-on-write one owns at most the few small files git wrote.
     assert!(stock > 15 * 1024 * 1024, "stock exclusive {stock}");
     assert!(cow < 256 * 1024, "cow exclusive {cow}");
 
-    // sharetree's own measurement agrees.
     let out = sb.sharetree(&sb.p("cow"), &["du", "--raw"]);
     let line = String::from_utf8_lossy(&out.stdout).into_owned();
     let excl: u64 = line.split('\t').nth(1).unwrap().parse().unwrap();
@@ -155,7 +145,6 @@ fn reshare_recovers_sharing_after_git_rewrites() {
     eprintln!("reshare: exclusive {before} -> {after}");
     assert!(before > 15 * 1024 * 1024 && after < 256 * 1024);
 
-    // Content, stat data and index untouched: no rehash on the next status.
     assert_eq!(snapshot(&stock), snap);
     assert!(sb
         .git_raw(&stock, &["diff-files", "--quiet"])
@@ -164,7 +153,6 @@ fn reshare_recovers_sharing_after_git_rewrites() {
     let index_after = fs::read(&index_path).unwrap();
     assert_eq!(index_before, index_after);
 
-    // Idempotent.
     let err = sb.sharetree_ok(&stock, &["reshare", "--from", &main.to_string_lossy()]);
     assert!(
         err.contains("shared 0 files") && err.contains("31 already shared"),
@@ -182,12 +170,24 @@ fn reshare_never_merges_different_content() {
         &main,
         &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
     );
-    // Same size, different bytes, stat-clean in neither index: a dirty file
-    // is never offered, and even if it were the kernel compares bytes.
     let mut d = fs::read(wt.join("big.bin")).unwrap();
     d[0] ^= 0xff;
     fs::write(wt.join("big.bin"), &d).unwrap();
     sb.sharetree_ok(&wt, &["reshare"]);
     assert_eq!(fs::read(wt.join("big.bin")).unwrap(), d);
     assert_eq!(fs::read(main.join("big.bin")).unwrap(), bytes(100, 300_000));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn reshare_rejects_an_explicit_donor_on_a_different_filesystem() {
+    let Some(donor_box) = Sandbox::tmpfs() else {
+        return;
+    };
+    let target_box = Sandbox::home();
+    let donor = donor_box.repo("donor", &[]);
+    let target = target_box.repo("target", &[]);
+    let out = target_box.sharetree(&target, &["reshare", "--from", donor.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("same filesystem"));
 }

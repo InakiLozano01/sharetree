@@ -1,9 +1,3 @@
-# Maintainer: InakiLozano01 <REPLACE-WITH-EMAIL>
-#
-# Prebuilt static (musl) binaries from the GitHub release. Before publishing
-# a version: set pkgver, then replace the checksums with the contents of the
-# release's .sha256 files (or run `updpkgsums`), and regenerate .SRCINFO with
-# `makepkg --printsrcinfo > .SRCINFO`.
 pkgname=sharetree-bin
 pkgver=0.1.0
 pkgrel=1
@@ -22,7 +16,6 @@ provides=('sharetree')
 conflicts=('sharetree')
 source_x86_64=("$url/releases/download/v$pkgver/sharetree-v$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/sharetree-v$pkgver-aarch64-unknown-linux-musl.tar.gz")
-# Placeholders: replace with the release's checksums before publishing.
 sha256sums_x86_64=('0000000000000000000000000000000000000000000000000000000000000000')
 sha256sums_aarch64=('0000000000000000000000000000000000000000000000000000000000000000')
 

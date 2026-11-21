@@ -1,9 +1,3 @@
-//! Git checkout rules for reuse. Clone only paths included in this worktree's
-//! checkout whose bytes Git would write unchanged from the target blob.
-//!
-//! Attributes are read from the *target* commit (`check-attr --source`),
-//! never from the donor's working tree.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -20,10 +14,8 @@ const ATTRS: [&str; 6] = [
     "filter",
 ];
 
-/// Repository-wide line-ending policy for the new worktree.
 #[derive(Clone, Copy, Debug)]
 struct EolPolicy {
-    /// Would git write CRLF for text files? (core.autocrlf=true or core.eol=crlf)
     crlf_output: bool,
 }
 
@@ -32,7 +24,6 @@ fn eol_policy(worktree: &Path) -> Result<EolPolicy> {
         if autocrlf.eq_ignore_ascii_case("input") {
             return Ok(EolPolicy { crlf_output: false });
         }
-        // Git accepts implicit true and numeric booleans as well as words.
         if git::config_bool(worktree, "core.autocrlf")? == Some(true) {
             return Ok(EolPolicy { crlf_output: true });
         }
@@ -51,30 +42,23 @@ fn unsetish(v: &str) -> bool {
     v == "unspecified" || v == "unset"
 }
 
-/// Would checkout write exactly the blob bytes for a path with these values
-/// of [`ATTRS`]?
 fn raw_checkout(vals: &[&str; 6], policy: EolPolicy) -> bool {
     let [text, eol, crlf, ident, wte, filter] = *vals;
     if !unsetish(filter) || !unsetish(ident) || !unsetish(wte) {
-        return false; // smudge filters (LFS), $Id$ expansion, re-encoding
+        return false;
     }
     if !unsetish(crlf) {
         return false;
     }
     if !(unsetish(eol) || eol == "lf") {
-        return false; // eol=crlf converts LF -> CRLF
+        return false;
     }
     if policy.crlf_output {
-        // Text files get CRLF; only explicitly binary paths are raw.
         return text == "unset";
     }
-    // LF output never rewrites blob bytes (git does not turn CRLF into LF on
-    // checkout), whatever `text` says.
     true
 }
 
-/// Filter candidate paths using the worktree's sparse-checkout rules and
-/// the target commit's checkout conversions.
 pub fn reusable_paths(worktree: &Path, target: &str, paths: &[&[u8]]) -> Result<HashSet<Vec<u8>>> {
     if paths.is_empty() {
         return Ok(HashSet::new());
@@ -94,15 +78,11 @@ pub fn reusable_paths(worktree: &Path, target: &str, paths: &[&[u8]]) -> Result<
     raw_paths(worktree, target, paths)
 }
 
-/// Return the subset of `paths` that git checks out byte-for-byte.
 fn raw_paths(worktree: &Path, target: &str, paths: &[&[u8]]) -> Result<HashSet<Vec<u8>>> {
     if paths.is_empty() {
         return Ok(HashSet::new());
     }
     let policy = eol_policy(worktree)?;
-    // One check-attr is single-threaded (0.4 s for the kernel's 62k paths):
-    // shard large batches over several processes, contiguously, so each one
-    // keeps walking neighbouring directories.
     let shards = if paths.len() < 4096 {
         1
     } else {
@@ -123,9 +103,6 @@ fn raw_paths(worktree: &Path, target: &str, paths: &[&[u8]]) -> Result<HashSet<V
     for (out, part) in outs.iter().zip(paths.chunks(chunk)) {
         parse_rows(out, part, &mut rows)?;
     }
-    // A `filter` attribute only converts when its driver is configured (git
-    // ignores undefined, non-required drivers). Repos like git.git tag files
-    // with filters most clones never define.
     let mut active: HashMap<&str, bool> = HashMap::new();
     for (_, vals) in &rows {
         let f = vals[5];
@@ -161,7 +138,6 @@ fn nul_terminated(paths: &[&[u8]]) -> Vec<u8> {
     input
 }
 
-/// Records: <path> NUL <attr> NUL <value> NUL, ATTRS.len() per path, in order.
 fn parse_rows<'a>(
     out: &'a [u8],
     paths: &[&'a [u8]],
@@ -187,8 +163,6 @@ fn parse_rows<'a>(
     Ok(())
 }
 
-/// Would git run a smudge for filter driver `name`? (`required` without a
-/// driver makes checkout fail; leave that to git too.)
 fn filter_configured(worktree: &Path, name: &str) -> Result<bool> {
     for key in ["smudge", "process"] {
         if git::config_get(worktree, &format!("filter.{name}.{key}"))?.is_some() {
@@ -261,7 +235,6 @@ mod tests {
         )
         .unwrap();
         git::output(root, &["sparse-checkout", "set", "--cone", "include"]).unwrap();
-        // Only the target commit declares the conversion.
         fs::write(root.join(".gitattributes"), b"").unwrap();
         let paths: &[&[u8]] = &[b"include/plain", b"include/convert", b"omit/file"];
         assert_eq!(

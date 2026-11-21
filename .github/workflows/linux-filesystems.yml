@@ -35,4 +35,4 @@ jobs:
       - name: Run native filesystem scenarios
         env:
           FILESYSTEM: ${{ matrix.filesystem }}
-        run: bash scripts/test-linux-filesystems.sh "$FILESYSTEM"
+        run: exec bash scripts/test-linux-filesystems.sh "$FILESYSTEM"

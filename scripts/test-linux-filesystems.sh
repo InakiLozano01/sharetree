@@ -1,4 +1,5 @@
 set -euo pipefail
+set +m
 
 fail() {
     printf '%s\n' "$*" >&2
@@ -70,6 +71,7 @@ remove_image_fixture() {
 cleanup() {
     local status=$? cleanup_status=0
     trap - EXIT
+    trap '' INT TERM
     remove_mount "$tmpfs_dir" "$tmpfs_source" tmpfs || cleanup_status=1
     remove_image_fixture || cleanup_status=1
     if (( cleanup_status != 0 )) || ! rmdir -- "$root"; then
@@ -80,16 +82,47 @@ cleanup() {
     exit "$status"
 }
 
+run_child() {
+    local output=$1 status=0
+    shift
+    if [[ -n $output ]]; then
+        setsid -- "$@" >"$output" 2>&1 &
+    else
+        setsid -- "$@" &
+    fi
+    child_pid=$!
+    wait "$child_pid" || status=$?
+    child_pid=
+    return "$status"
+}
+
+cancel() {
+    local status=$1 attempt
+    trap '' INT TERM
+    if [[ -n $child_pid ]]; then
+        kill -TERM -- "-$child_pid" 2>/dev/null || kill -TERM -- "$child_pid" 2>/dev/null || :
+        for attempt in {1..10}; do
+            if ! kill -0 -- "-$child_pid" 2>/dev/null && ! kill -0 -- "$child_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        kill -KILL -- "-$child_pid" 2>/dev/null || kill -KILL -- "$child_pid" 2>/dev/null || :
+        wait "$child_pid" 2>/dev/null || :
+    fi
+    exit "$status"
+}
+
 run_scenario() {
-    local suite=$1 scenario=$2 output status=0
+    local suite=$1 scenario=$2 output=$mount_dir/scenario.log status=0
     printf '\nRunning %s::%s\n' "$suite" "$scenario"
-    output=$(cargo test --locked --test "$suite" -- "$scenario" --exact --nocapture 2>&1) || status=$?
-    printf '%s\n' "$output"
+    run_child "$output" cargo test --locked --test "$suite" -- "$scenario" --exact --nocapture || status=$?
+    cat -- "$output"
     if (( status != 0 )); then
         return "$status"
     fi
-    if [[ $output == *SKIP:* ]] ||
-        ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
+    if grep -q 'SKIP:' "$output" ||
+        ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output"; then
         fail "Expected one executed passing test for $suite::$scenario"
     fi
 }
@@ -99,9 +132,10 @@ image=$root/$filesystem.img
 mount_dir=$root/mount
 tmpfs_dir=$root/tmpfs
 tmpfs_source=sharetree-tmpfs-${root##*.}
+child_pid=
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'cancel 130' INT
+trap 'cancel 143' TERM
 
 printf '::group::%s fixture preflight\n' "$filesystem"
 mkdir -- "$mount_dir"
@@ -109,12 +143,12 @@ truncate -s 2G -- "$image"
 case $filesystem in
     btrfs)
         btrfs --version
-        mkfs.btrfs "$image"
+        run_child '' mkfs.btrfs "$image"
         export SHARETREE_REQUIRE_BTRFS=1
         ;;
     xfs)
         mkfs.xfs -V
-        mkfs.xfs -m reflink=1 "$image"
+        run_child '' mkfs.xfs -m reflink=1 "$image"
         export SHARETREE_REQUIRE_XFS=1
         ;;
 esac

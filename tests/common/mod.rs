@@ -94,7 +94,7 @@ impl Sandbox {
         self.root().join(rel)
     }
 
-    fn env(&self, c: &mut Command) {
+    pub(super) fn env(&self, c: &mut Command) {
         c.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))

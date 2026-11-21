@@ -158,9 +158,21 @@ fn warm_rollback_removes_clones_from_a_tracked_directory() {
     assert_eq!(mode(warmed.join("tracked/cache")), 0o750);
     let tracked_mode = mode(warmed.join("tracked"));
 
-    let max_target_len = libc::PATH_MAX as usize - 1;
-    let padding = max_target_len - main.as_os_str().len() - 1;
-    std::os::unix::fs::symlink(main.join("x".repeat(padding)), main.join("z-long-link")).unwrap();
+    let long_link = main.join("z-long-link");
+    let mut min_padding = 1;
+    let mut max_padding = libc::PATH_MAX as usize - main.as_os_str().len() - 2;
+    while min_padding < max_padding {
+        let padding = min_padding + (max_padding - min_padding).div_ceil(2);
+        match std::os::unix::fs::symlink(main.join("x".repeat(padding)), &long_link) {
+            Ok(()) => {
+                fs::remove_file(&long_link).unwrap();
+                min_padding = padding;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => max_padding = padding - 1,
+            Err(e) => panic!("probing Btrfs symlink size: {e}"),
+        }
+    }
+    std::os::unix::fs::symlink(main.join("x".repeat(min_padding)), long_link).unwrap();
     let dest = sb.p("rollback");
     let out = sb.sharetree(
         &main,

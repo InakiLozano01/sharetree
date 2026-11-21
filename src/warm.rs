@@ -455,14 +455,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rollback_removes_created_symlinks_and_directories() {
+    fn rollback_preserves_existing_cache_directory_and_mode() {
         let dir = tempfile::tempdir().unwrap();
         let donor = dir.path().join("donor");
         let dest = dir.path().join("dest");
-        fs::create_dir_all(donor.join("tracked/cache")).unwrap();
-        std::os::unix::fs::symlink("asset", donor.join("tracked/cache/link")).unwrap();
-        fs::create_dir_all(dest.join("tracked")).unwrap();
-        let original = dest.join("tracked/original");
+        let donor_cache = donor.join("tracked/cache");
+        fs::create_dir_all(donor_cache.join("nested")).unwrap();
+        fs::set_permissions(&donor_cache, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("asset", donor_cache.join("nested/link")).unwrap();
+        let cache = dest.join("tracked/cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o750)).unwrap();
+        let original = cache.join("original");
         fs::write(&original, "keep").unwrap();
 
         let mut ctx = Ctx {
@@ -476,12 +480,15 @@ mod tests {
         };
         assert!(ctx.select(b"tracked/cache", &mut Stats::default()).is_ok());
         assert_eq!(
-            fs::read_link(dest.join("tracked/cache/link")).unwrap(),
+            fs::read_link(cache.join("nested/link")).unwrap(),
             Path::new("asset")
         );
+        let mode = || fs::metadata(&cache).unwrap().mode() & 0o7777;
+        assert_eq!(mode(), 0o750);
         ctx.rollback(0).unwrap();
         assert_eq!(fs::read(original).unwrap(), b"keep");
-        assert!(!dest.join("tracked/cache").exists());
+        assert!(!cache.join("nested").exists());
+        assert_eq!(mode(), 0o750);
     }
 
     #[test]

@@ -598,6 +598,33 @@ mod engine {
         unsupported: usize,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Lifecycle {
+        Planned,
+        Registered,
+        Populated,
+        Completed,
+        RolledBack,
+    }
+
+    impl Lifecycle {
+        fn advance(self, next: Self) -> Result<Self> {
+            let allowed = matches!(
+                (self, next),
+                (Self::Planned, Self::Registered)
+                    | (Self::Registered, Self::Populated)
+                    | (Self::Populated, Self::Completed)
+                    | (Self::Registered, Self::RolledBack)
+                    | (Self::Populated, Self::RolledBack)
+            );
+            if allowed {
+                Ok(next)
+            } else {
+                bail!("invalid worktree lifecycle transition: {self:?} -> {next:?}")
+            }
+        }
+    }
+
     pub(super) fn ensure_seed(
         cwd: &Path,
         repo_root: &Path,
@@ -804,6 +831,7 @@ mod engine {
         if !status.success() {
             return Ok(status.code().unwrap_or(1));
         }
+        let mut lifecycle = Lifecycle::Planned.advance(Lifecycle::Registered)?;
         trace.phase("register+scan", t);
 
         let prepared = (|| -> Result<_> {
@@ -824,12 +852,17 @@ mod engine {
             Ok((status, target, report))
         })();
         let (target, report) = match prepared {
-            Ok((status, target, report)) if status.success() => (target, report),
+            Ok((status, target, report)) if status.success() => {
+                lifecycle = lifecycle.advance(Lifecycle::Populated)?;
+                (target, report)
+            }
             Ok((status, _, _)) => {
+                let _ = lifecycle.advance(Lifecycle::RolledBack);
                 rollback_registration(cwd, dest);
                 return Ok(status.code().unwrap_or(1));
             }
             Err(e) => {
+                let _ = lifecycle.advance(Lifecycle::RolledBack);
                 rollback_registration(cwd, dest);
                 return Err(e);
             }
@@ -878,6 +911,7 @@ mod engine {
                 _ => eprintln!("sharetree: --warm skipped: no donor worktree we could reflink from (caches are never byte-copied)"),
             }
         }
+        let _ = lifecycle.advance(Lifecycle::Completed)?;
         Ok(hook_code)
     }
 
@@ -1390,7 +1424,35 @@ mod engine {
 
     #[cfg(test)]
     mod tests {
-        use super::{reusable_tree_path, reusable_windows_component};
+        use super::{reusable_tree_path, reusable_windows_component, Lifecycle};
+
+        #[test]
+        fn lifecycle_accepts_creation_and_rollback_paths() {
+            let phase = Lifecycle::Planned
+                .advance(Lifecycle::Registered)
+                .unwrap()
+                .advance(Lifecycle::Populated)
+                .unwrap()
+                .advance(Lifecycle::Completed)
+                .unwrap();
+            assert_eq!(phase, Lifecycle::Completed);
+
+            let phase = Lifecycle::Planned
+                .advance(Lifecycle::Registered)
+                .unwrap()
+                .advance(Lifecycle::RolledBack)
+                .unwrap();
+            assert_eq!(phase, Lifecycle::RolledBack);
+        }
+
+        #[test]
+        fn lifecycle_rejects_skipped_or_reopened_phases() {
+            assert!(Lifecycle::Planned.advance(Lifecycle::Populated).is_err());
+            assert!(Lifecycle::Completed.advance(Lifecycle::RolledBack).is_err());
+            assert!(Lifecycle::RolledBack
+                .advance(Lifecycle::Registered)
+                .is_err());
+        }
 
         #[test]
         fn clone_paths_require_normal_relative_components() {

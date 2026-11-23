@@ -66,7 +66,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
@@ -81,10 +81,7 @@ mod imp {
 
     fn clean_files(wt: &Path) -> Result<Vec<(Vec<u8>, String)>> {
         let entries = git::ls_files_stage(wt)?;
-        let dirty: HashSet<Vec<u8>> =
-            git::split_z(&git::output(wt, &["diff-files", "-z", "--name-only"])?)
-                .into_iter()
-                .collect();
+        let dirty = git::changed_tracked_paths(wt, false)?;
         Ok(entries
             .into_iter()
             .filter(|(p, mode, _)| {

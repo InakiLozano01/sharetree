@@ -225,6 +225,19 @@ fn warm_skips_other_worktrees_nested_in_the_donor() {
     let err = sb.sharetree_ok(&main, &["add", "--warm", "--detach", ".worktrees/b"]);
     assert!(!main.join(".worktrees/b/.worktrees").exists(), "{err}");
     assert!(main.join(".worktrees/b/node_modules/pkg/index.js").exists());
+    let dest = sb.p("using-nested-donor");
+    sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            ".worktrees/b",
+            &dest.to_string_lossy(),
+        ],
+    );
+    assert!(dest.join("node_modules/pkg/index.js").exists());
 }
 
 #[test]

@@ -363,6 +363,26 @@ pub fn ls_files_stage(dir: &Path) -> Result<Vec<(Vec<u8>, u32, String)>> {
     Ok(v)
 }
 
+pub fn changed_tracked_paths(
+    dir: &Path,
+    include_staged: bool,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let out = output(
+        dir,
+        &["status", "--porcelain=v1", "-z", "-uno", "--no-renames"],
+    )?;
+    let mut paths = std::collections::HashSet::new();
+    for record in split_z(&out) {
+        if record.len() < 4 || record[2] != b' ' {
+            bail!("unexpected Git status record in {}", dir.display());
+        }
+        if include_staged || record[1] != b' ' {
+            paths.insert(record[3..].to_vec());
+        }
+    }
+    Ok(paths)
+}
+
 pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
     out.split(|&b| b == 0)
         .filter(|r| !r.is_empty())

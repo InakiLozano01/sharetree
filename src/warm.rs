@@ -370,7 +370,7 @@ pub fn run(donor: &Path, dest: &Path, wts: &[Worktree], quiet: bool, trace: &Tra
     let mut holes: Vec<PathBuf> = wts
         .iter()
         .map(|w| util::canon(&w.path))
-        .filter(|p| *p != donor_canon)
+        .filter(|p| *p != donor_canon && p.starts_with(&donor_canon))
         .collect();
     holes.push(util::canon(dest));
     holes.push(util::canon(&git::common_dir(donor)?));

@@ -1102,14 +1102,13 @@ mod engine {
             } else {
                 &trees[&c.head]
             };
-            let dirty: HashSet<Vec<u8>> =
-                match git::output(&c.path, &["diff-index", "-z", "--name-only", "HEAD", "--"]) {
-                    Ok(out) => git::split_z(&out).into_iter().collect(),
-                    Err(e) => {
-                        trace.note(format!("skipping donor {}: {e:#}", c.path.display()));
-                        continue;
-                    }
-                };
+            let dirty = match git::changed_tracked_paths(&c.path, true) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    trace.note(format!("skipping donor {}: {e:#}", c.path.display()));
+                    continue;
+                }
+            };
             trace.phase("donor status", t);
             let dirty_regular = dirty
                 .iter()

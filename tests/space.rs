@@ -112,11 +112,7 @@ fn btrfs_exclusive_bytes_are_near_zero() {
 
 #[test]
 fn reshare_recovers_sharing_after_git_rewrites() {
-    let Some(sb) = Sandbox::reflink() else { return };
-    if fs_type(sb.root()) != "btrfs" {
-        eprintln!("SKIP: not btrfs");
-        return;
-    }
+    let Some(sb) = Sandbox::btrfs() else { return };
     let main = big_repo(&sb);
     let stock = sb.p("stock");
     sb.git(
@@ -130,6 +126,7 @@ fn reshare_recovers_sharing_after_git_rewrites() {
         ],
     );
     let Some(before) = exclusive(&stock) else {
+        assert!(!require_btrfs(), "`btrfs filesystem du` is required");
         eprintln!("SKIP: `btrfs filesystem du` unavailable");
         return;
     };
@@ -143,6 +140,23 @@ fn reshare_recovers_sharing_after_git_rewrites() {
     );
     let index_before = fs::read(&index_path).unwrap();
 
+    for checkout in [&main, &stock] {
+        for i in 0..16 {
+            let path = checkout.join(format!("assets/blob{i}.bin"));
+            let replacement = checkout.join("replacement");
+            fs::copy(&path, &replacement).unwrap();
+            fs::rename(replacement, path).unwrap();
+        }
+        assert!(!sb
+            .git_raw(checkout, &["diff-files", "--quiet"])
+            .status
+            .success());
+    }
+
+    let cow = sb.p("after-move");
+    let add_result = sb.sharetree_ok(&main, &["add", "--detach", &cow.to_string_lossy()]);
+    assert_eq!(reflinked(&add_result), 31, "{add_result}");
+
     let err = sb.sharetree_ok(&stock, &["reshare", "--from", &main.to_string_lossy()]);
     assert!(err.contains("shared 31 files"), "{err}");
     let after = exclusive(&stock).unwrap();
@@ -151,9 +165,11 @@ fn reshare_recovers_sharing_after_git_rewrites() {
 
     assert_eq!(snapshot(&stock), snap);
     assert!(sb
-        .git_raw(&stock, &["diff-files", "--quiet"])
-        .status
-        .success());
+        .git(
+            &stock,
+            &["--no-optional-locks", "status", "--porcelain", "-uno"]
+        )
+        .is_empty());
     let index_after = fs::read(&index_path).unwrap();
     assert_eq!(index_before, index_after);
 

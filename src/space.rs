@@ -1,4 +1,9 @@
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -26,27 +31,50 @@ fn top_entries(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(v)
 }
 
-fn allocated(p: &Path) -> u64 {
-    let Ok(md) = p.symlink_metadata() else {
-        return 0;
-    };
+struct Allocation<'a> {
+    checkout_roots: &'a HashSet<PathBuf>,
     #[cfg(unix)]
-    let own = {
-        use std::os::unix::fs::MetadataExt;
-        md.blocks() * 512
-    };
-    #[cfg(not(unix))]
-    let own = md.len();
-    if md.is_dir() {
-        own + std::fs::read_dir(p)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| allocated(&e.path()))
-                    .sum::<u64>()
-            })
-            .unwrap_or(0)
-    } else {
-        own
+    hardlinks: HashMap<(u64, u64), u64>,
+    #[cfg(target_os = "linux")]
+    pruned_checkout: bool,
+}
+
+impl Allocation<'_> {
+    fn allocated(&mut self, p: &Path) -> u64 {
+        if self.checkout_roots.contains(p) {
+            #[cfg(target_os = "linux")]
+            {
+                self.pruned_checkout = true;
+            }
+            return 0;
+        }
+        let Ok(md) = p.symlink_metadata() else {
+            return 0;
+        };
+        #[cfg(unix)]
+        let own = {
+            if !md.is_dir() && md.nlink() > 1 {
+                let count = self.hardlinks.entry((md.dev(), md.ino())).or_default();
+                *count += 1;
+                if *count > 1 {
+                    return 0;
+                }
+            }
+            md.blocks() * 512
+        };
+        #[cfg(not(unix))]
+        let own = md.len();
+        if md.is_dir() {
+            own + std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| self.allocated(&e.path()))
+                        .sum::<u64>()
+                })
+                .unwrap_or(0)
+        } else {
+            own
+        }
     }
 }
 
@@ -90,53 +118,93 @@ fn parse_btrfs_du(text: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn fiemap_unshared(p: &Path) -> Option<u64> {
-    let md = p.symlink_metadata().ok()?;
-    if md.is_dir() {
-        let mut sum = 0;
-        for e in std::fs::read_dir(p).ok()?.filter_map(|e| e.ok()) {
-            sum += fiemap_unshared(&e.path())?;
+impl Allocation<'_> {
+    fn fiemap_unshared(&mut self, p: &Path) -> Option<u64> {
+        if self.checkout_roots.contains(p) {
+            return Some(0);
         }
-        Some(sum)
-    } else if md.is_file() {
-        let f = std::fs::File::open(p).ok()?;
-        let ext = crate::linux::extents(&f, true).ok()?;
-        Some(ext.iter().filter(|e| !e.shared()).map(|e| e.length).sum())
-    } else {
-        Some(0)
+        let md = p.symlink_metadata().ok()?;
+        if md.is_dir() {
+            let mut sum = 0;
+            for entry in std::fs::read_dir(p).ok()? {
+                sum += self.fiemap_unshared(&entry.ok()?.path())?;
+            }
+            Some(sum)
+        } else if md.is_file() {
+            if md.nlink() > 1 && self.hardlinks.remove(&(md.dev(), md.ino())) != Some(md.nlink()) {
+                return Some(0);
+            }
+            let file = crate::reflink::open_no_follow(p).ok()?;
+            let extents = crate::linux::extents(&file, true).ok()?;
+            Some(
+                extents
+                    .iter()
+                    .filter(|e| !e.shared())
+                    .map(|e| e.length)
+                    .sum(),
+            )
+        } else {
+            Some(0)
+        }
+    }
+
+    fn exclusive(&mut self, root: &Path, entries: &[PathBuf]) -> Option<Exclusive> {
+        if !self.pruned_checkout
+            && self.hardlinks.is_empty()
+            && crate::linux::fs_magic(root) == Some(crate::linux::BTRFS_SUPER_MAGIC)
+        {
+            if let Some(bytes) = btrfs_exclusive(entries) {
+                return Some(Exclusive {
+                    bytes,
+                    method: "btrfs fi du",
+                });
+            }
+        }
+        let bytes = entries
+            .iter()
+            .map(|entry| self.fiemap_unshared(entry))
+            .sum::<Option<u64>>()?;
+        Some(Exclusive {
+            bytes,
+            method: "fiemap estimate",
+        })
     }
 }
 
-fn measure(root: &Path) -> Result<Usage> {
-    let entries = top_entries(root)?;
-    let apparent = entries.iter().map(|e| allocated(e)).sum();
+fn checkout_roots(worktrees: &[Worktree]) -> HashSet<PathBuf> {
+    worktrees
+        .iter()
+        .filter(|w| !w.bare)
+        .filter_map(|w| w.path.canonicalize().ok())
+        .collect()
+}
+
+fn measure(root: &Path, registered: Option<&HashSet<PathBuf>>) -> Result<Usage> {
+    let local_roots;
+    let checkout_roots = match registered {
+        Some(roots) => roots,
+        None => {
+            local_roots = checkout_roots(&git::list_worktrees(root).unwrap_or_default());
+            &local_roots
+        }
+    };
+    let root = root.canonicalize()?;
+    let entries = top_entries(&root)?;
+    let mut allocation = Allocation {
+        checkout_roots,
+        #[cfg(unix)]
+        hardlinks: HashMap::new(),
+        #[cfg(target_os = "linux")]
+        pruned_checkout: false,
+    };
+    let apparent = entries.iter().map(|e| allocation.allocated(e)).sum();
     #[cfg(target_os = "linux")]
-    let exclusive = exclusive(root, &entries);
+    let exclusive = allocation.exclusive(&root, &entries);
     #[cfg(not(target_os = "linux"))]
     let exclusive = None;
     Ok(Usage {
         apparent,
         exclusive,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn exclusive(root: &Path, entries: &[PathBuf]) -> Option<Exclusive> {
-    if crate::linux::fs_magic(root) == Some(crate::linux::BTRFS_SUPER_MAGIC) {
-        if let Some(bytes) = btrfs_exclusive(entries) {
-            return Some(Exclusive {
-                bytes,
-                method: "btrfs fi du",
-            });
-        }
-    }
-    let bytes = entries
-        .iter()
-        .map(|entry| fiemap_unshared(entry))
-        .sum::<Option<u64>>()?;
-    Some(Exclusive {
-        bytes,
-        method: "fiemap estimate",
     })
 }
 
@@ -159,6 +227,11 @@ pub(crate) fn run_ls(args: &[OsString]) -> Result<i32> {
     }
     let cwd = std::env::current_dir()?;
     let worktrees = git::list_worktrees(&cwd)?;
+    let registered = if sizes {
+        checkout_roots(&worktrees)
+    } else {
+        HashSet::new()
+    };
     if sizes {
         sync_before_measuring();
         println!(
@@ -194,7 +267,7 @@ pub(crate) fn run_ls(args: &[OsString]) -> Result<i32> {
             continue;
         }
         let (excl, app) = if has_checkout(w) {
-            let usage = measure(&w.path)?;
+            let usage = measure(&w.path, Some(&registered))?;
             measured_any |= usage.exclusive.is_some();
             (
                 usage.exclusive.map_or("?".into(), |x| human(x.bytes)),
@@ -238,15 +311,21 @@ pub(crate) fn run_du(args: &[OsString]) -> Result<i32> {
         }
     }
     let cwd = std::env::current_dir()?;
-    if all {
-        paths = git::list_worktrees(&cwd)?
+    let registered = if all {
+        let worktrees = git::list_worktrees(&cwd)?;
+        let registered = checkout_roots(&worktrees);
+        paths = worktrees
             .into_iter()
             .filter(has_checkout)
             .map(|w| w.path)
             .collect();
-    } else if paths.is_empty() {
-        paths.push(git::toplevel(&cwd)?);
-    }
+        Some(registered)
+    } else {
+        if paths.is_empty() {
+            paths.push(git::toplevel(&cwd)?);
+        }
+        None
+    };
     sync_before_measuring();
     if !raw {
         println!(
@@ -255,7 +334,7 @@ pub(crate) fn run_du(args: &[OsString]) -> Result<i32> {
         );
     }
     for p in &paths {
-        let u = measure(p)?;
+        let u = measure(p, registered.as_ref())?;
         if raw {
             println!(
                 "{}\t{}\t{}",

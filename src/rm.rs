@@ -501,6 +501,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         let admin = registered_admin(&common, &wt.path)?.with_context(|| {
             format!("cannot confirm Git registration for {}", wt.path.display())
         })?;
+        reject_mounts(&admin)?;
         reject_submodule_worktrees(&admin)?;
         if let Some(parked) = ParkedWorktree::recover(&wt.path, &admin, &common)? {
             parked.unregister(&admin)?;

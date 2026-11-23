@@ -714,10 +714,26 @@ fn is_owned_submodule(path: &Path, admin: &Path, parent_admin: &Path) -> Result<
 }
 
 fn seed_is_clean(path: &Path) -> bool {
-    git::output(path, &["ls-files", "-v", "-z"]).is_ok_and(|index| {
-        index
-            .split(|&byte| byte == 0)
-            .all(|entry| entry.is_empty() || entry.starts_with(b"H "))
+    git::output(path, &["ls-files", "--stage", "-v", "-z"]).is_ok_and(|index| {
+        git::split_z(&index).into_iter().all(|entry| {
+            if !entry.starts_with(b"H ") {
+                return false;
+            }
+            if !entry.starts_with(b"H 160000 ") {
+                return true;
+            }
+            let Some(tab) = entry.iter().position(|&byte| byte == b'\t') else {
+                return false;
+            };
+            let gitlink = path.join(crate::util::bytes_to_path(&entry[tab + 1..]));
+            match gitlink.symlink_metadata() {
+                Ok(info) if info.is_dir() => {
+                    std::fs::read_dir(&gitlink).is_ok_and(|mut entries| entries.next().is_none())
+                }
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+                Ok(_) => false,
+            }
+        })
     }) && git::output(
         path,
         &[
@@ -1289,6 +1305,11 @@ mod tests {
         .unwrap();
         let checkout = root.join(volume::SEED_DIR);
         fixture_worktree(&repo, &checkout, volume::SEED_LOCK_REASON);
+        assert!(worktrees_in(&root).unwrap()[0].seed);
+        let local = checkout.join("path/to/module/local-only");
+        std::fs::write(&local, b"keep").unwrap();
+        assert!(!worktrees_in(&root).unwrap()[0].seed);
+        std::fs::remove_file(local).unwrap();
         git::output(
             &checkout,
             &[

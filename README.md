@@ -78,7 +78,7 @@ sharetree add [<git worktree add options>] [--from <worktree>] [--warm]
 sharetree rm [-f [-f]] [--sync] <worktree>
 sharetree ls [--no-size]
 sharetree du [--all] [--raw] [<path>...]
-sharetree reshare [<worktree>] [--from <worktree>] [--dry-run] [--min-size <bytes>]
+sharetree reshare [<worktree> | --all] [--from <worktree>] [--dry-run] [--min-size <bytes>]
 sharetree doctor [<path>]
 sharetree mount [--unmount] (--all | <worktree>...)
 sharetree setup volume|devdrive|status|mount|teardown|auto ...
@@ -125,10 +125,19 @@ builds would wait. `-q` or `SHARETREE_NO_ADVICE=1` silences the hint.
 
 **`reshare`** (Linux) gets sharing back in a worktree where git rewrote files:
 one made by plain `git worktree add`, or after a `git switch` away and back. It
-asks the kernel to deduplicate (`FIDEDUPERANGE`) each stat-clean tracked file
+asks the kernel to deduplicate (`FIDEDUPERANGE`) each unchanged tracked file
 against a donor copy of the same blob. The kernel compares the bytes itself and
-shares only if they are equal, so content cannot change. Inodes and timestamps
-stay the same, so the index stays valid and `git status` stays fast.
+shares only if they are equal, so content cannot change. Sharetree reads Git's
+index without rewriting it. Filesystems that update file timestamps during
+deduplication can make the next `git status` rehash those files once.
+
+Run `sharetree reshare --all` to scan the repository's worktrees on the current filesystem once and
+deduplicate eligible files by device, blob ID and file size. Each target
+can try up to four donor copies. `--all` takes no worktree argument or
+`--from`. Use `--dry-run` to
+count candidates before the kernel checks byte equality. Reported shared
+bytes describe file ranges. See [space accounting](#why-du-lies-and-how-to-measure)
+for physical savings.
 
 ### `--warm`: ignored build caches
 

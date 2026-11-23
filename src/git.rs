@@ -367,10 +367,44 @@ pub fn changed_tracked_paths(
     dir: &Path,
     include_staged: bool,
 ) -> Result<std::collections::HashSet<Vec<u8>>> {
-    let out = output(
-        dir,
-        &["status", "--porcelain=v1", "-z", "-uno", "--no-renames"],
-    )?;
+    changed_tracked_paths_impl(dir, include_staged, &[])
+}
+
+#[cfg(target_os = "linux")]
+pub fn changed_tracked_paths_under(
+    dir: &Path,
+    paths: &[&[u8]],
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let args = paths
+        .iter()
+        .map(|path| {
+            let mut spec = b":(top,literal)".to_vec();
+            spec.extend_from_slice(path);
+            OsString::from_vec(spec)
+        })
+        .collect::<Vec<_>>();
+    changed_tracked_paths_impl(dir, false, &args)
+}
+
+fn changed_tracked_paths_impl(
+    dir: &Path,
+    include_staged: bool,
+    pathspecs: &[OsString],
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let mut args = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "-uno",
+        "--no-renames",
+        "--",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.extend_from_slice(pathspecs);
+    let out = output(dir, &args)?;
     let mut paths = std::collections::HashSet::new();
     for record in split_z(&out) {
         if record.len() < 4 || record[2] != b' ' {

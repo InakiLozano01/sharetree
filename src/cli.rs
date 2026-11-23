@@ -12,7 +12,7 @@ usage:
   sharetree rm [-f [-f]] [--sync] <worktree>
   sharetree ls [--no-size]
   sharetree du [--all] [--raw] [<path>...]
-  sharetree reshare [<worktree>] [--from <worktree>] [--dry-run] [--min-size <bytes>] [-v]
+  sharetree reshare [<worktree> | --all] [--from <worktree>] [--dry-run] [--min-size <bytes>] [-v]
   sharetree doctor [<path>]
   sharetree mount [--unmount] (--all | <worktree>...)
   sharetree setup volume|devdrive|status|mount|teardown|auto ...   (`sharetree setup help`)
@@ -39,7 +39,8 @@ rm       Remove a worktree: same safety checks as `git worktree remove`, then th
 ls       List worktrees with the bytes only they hold (where measurable).
 du       Show apparent size (what `du` reports) next to exclusive bytes.
 reshare  Linux: re-share files git rewrote, using FIDEDUPERANGE against a donor.
-         The kernel compares bytes; inodes, mtimes and the index stay valid.
+         --all scans the repository's checkouts on this filesystem once.
+         The kernel verifies byte equality. The Git index is read-only.
 doctor   Filesystem, backend `add` would use, volume, and dependency-store advice
          (pnpm, npm, yarn, bun, uv, pip, cargo, go).
 mount    Remount overlay worktrees after a reboot (the login unit runs --all).

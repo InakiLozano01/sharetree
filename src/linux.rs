@@ -120,10 +120,11 @@ const CHUNK: u64 = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub enum DedupeOutcome {
     Deduped(u64),
-    Differs,
+    Differs(u64),
+    Failed(u64, io::Error),
 }
 
-pub fn dedupe(src: &File, dst: &File, len: u64) -> io::Result<DedupeOutcome> {
+pub fn dedupe(src: &File, dst: &File, len: u64) -> DedupeOutcome {
     let mut offset = 0u64;
     while offset < len {
         let length = (len - offset).min(CHUNK);
@@ -143,20 +144,20 @@ pub fn dedupe(src: &File, dst: &File, len: u64) -> io::Result<DedupeOutcome> {
         };
         let rc = unsafe { libc::ioctl(src.as_raw_fd(), FIDEDUPERANGE as _, &mut r) };
         if rc != 0 {
-            return Err(io::Error::last_os_error());
+            return DedupeOutcome::Failed(offset, io::Error::last_os_error());
         }
         if r.info.status == FILE_DEDUPE_RANGE_DIFFERS {
-            return Ok(DedupeOutcome::Differs);
+            return DedupeOutcome::Differs(offset);
         }
         if r.info.status < 0 {
-            return Err(io::Error::from_raw_os_error(-r.info.status));
+            return DedupeOutcome::Failed(offset, io::Error::from_raw_os_error(-r.info.status));
         }
         if r.info.bytes_deduped == 0 || r.info.bytes_deduped > length {
-            return Err(io::Error::other("dedupe made no progress"));
+            return DedupeOutcome::Failed(offset, io::Error::other("dedupe made no progress"));
         }
         offset += r.info.bytes_deduped;
     }
-    Ok(DedupeOutcome::Deduped(offset))
+    DedupeOutcome::Deduped(offset)
 }
 
 pub const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;

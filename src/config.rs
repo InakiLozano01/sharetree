@@ -1,35 +1,5 @@
-//! User configuration: `$XDG_CONFIG_HOME/sharetree/config.toml` (Windows:
-//! `%APPDATA%\sharetree\config.toml`; `SHARETREE_CONFIG` overrides the path).
-//!
-//! ```toml
-//! auto_volume = false          # place worktrees in the volume when the
-//!                              # destination cannot reflink; unset: ask
-//!
-//! [[volume]]
-//! name = "default"
-//! kind = "btrfs"               # btrfs | xfs | devdrive
-//! image = "/home/me/.local/share/sharetree/volume.img"
-//! label = "sharetree"
-//! size = 107374182400
-//! mount = "udisks"             # udisks | fstab | devdrive
-//! mountpoint = "/run/media/me/sharetree"   # last seen (fstab: fixed)
-//! unit = "sharetree-volume-default.service"
-//!
-//! windows_clone = false        # Windows: ReFS block cloning (experimental)
-//!
-//! [[repo]]
-//! common_dir = "/home/me/src/app/.git"
-//! volume = "default"           # optional; default: the only volume
-//! auto_volume = true           # optional; overrides the global flag
-//!
-//! [[overlay]]                  # written by `sharetree add --overlay`
-//! path = "/home/me/src/app-fix"
-//! common_dir = "/home/me/src/app/.git"
-//! lower = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/bases/<commit>"
-//! upper = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/wt/app-fix/upper"
-//! work = "/home/me/.local/share/sharetree/overlay/app-1a2b3c4d/wt/app-fix/work"
-//! ```
-
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -53,15 +23,11 @@ impl VolumeKind {
     }
 }
 
-/// How the volume gets attached and mounted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MountMethod {
-    /// `udisksctl loop-setup` + `udisksctl mount`, no root (polkit).
     Udisks,
-    /// A root-owned fstab line the user added once.
     Fstab,
-    /// Windows: VHDX attached by a scheduled task.
     Devdrive,
 }
 
@@ -89,25 +55,36 @@ pub struct RepoConfig {
     pub auto_volume: Option<bool>,
 }
 
-/// An overlay worktree (`sharetree add --overlay`), remounted by
-/// `sharetree mount --all`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayPhase {
+    Creating,
+    #[default]
+    Ready,
+    Removing,
+}
+
+impl OverlayPhase {
+    fn is_ready(&self) -> bool {
+        *self == Self::Ready
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OverlayEntry {
-    /// Where the user sees the worktree (the mountpoint).
     pub path: PathBuf,
     pub common_dir: PathBuf,
-    /// The base checkout (lower layer).
     pub lower: PathBuf,
     pub upper: PathBuf,
     pub work: PathBuf,
+    #[serde(default, skip_serializing_if = "OverlayPhase::is_ready")]
+    pub phase: OverlayPhase,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    /// None: not decided yet (`add` asks on a terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_volume: Option<bool>,
-    /// Windows: block-clone on ReFS / Dev Drive (experimental, untested).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_clone: Option<bool>,
     #[serde(default, rename = "volume", skip_serializing_if = "Vec::is_empty")]
@@ -129,7 +106,6 @@ fn home() -> Option<PathBuf> {
     env_path("HOME").or_else(|| env_path("USERPROFILE"))
 }
 
-/// Directory holding `config.toml` (and, on Linux, nothing else).
 pub fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         return env_path("APPDATA").map(|p| p.join("sharetree"));
@@ -143,7 +119,6 @@ pub fn config_path() -> Option<PathBuf> {
     env_path("SHARETREE_CONFIG").or_else(|| config_dir().map(|d| d.join("config.toml")))
 }
 
-/// Where sharetree keeps volume images and generated scripts.
 pub fn data_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         return env_path("LOCALAPPDATA").map(|p| p.join("sharetree"));
@@ -153,7 +128,6 @@ pub fn data_dir() -> Option<PathBuf> {
         .map(|p| p.join("sharetree"))
 }
 
-/// systemd user units (`$XDG_CONFIG_HOME/systemd/user`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn systemd_user_dir() -> Option<PathBuf> {
     env_path("XDG_CONFIG_HOME")
@@ -173,31 +147,43 @@ impl Config {
         ))
     }
 
-    /// The config file, or an empty config when there is none.
     pub fn load() -> Result<Config> {
         let Some(p) = config_path() else {
             return Ok(Config::default());
         };
-        match std::fs::read_to_string(&p) {
+        Self::load_at(&p)
+    }
+
+    fn load_at(p: &Path) -> Result<Config> {
+        match std::fs::read_to_string(p) {
             Ok(t) => Config::parse(&t).with_context(|| p.display().to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
         }
     }
 
-    /// Write atomically (temp file + rename).
-    pub fn save(&self) -> Result<PathBuf> {
-        let Some(p) = config_path() else {
-            bail!("cannot locate a config directory (set HOME or XDG_CONFIG_HOME)");
-        };
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    pub fn update<T>(edit: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        Self::update_at(&required_config_path()?, edit)
+    }
+
+    fn update_at<T>(p: &Path, edit: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let lock = open_lock(p, ".lock")?;
+        lock.lock()
+            .with_context(|| format!("locking the config at {}", p.display()))?;
+        let previous = Self::load_at(p)?;
+        let mut next = previous.clone();
+        let result = edit(&mut next)?;
+        if next != previous {
+            let dir = p.parent().context("config path has no parent directory")?;
+            let mut tmp = tempfile::NamedTempFile::new_in(dir)
+                .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+            tmp.write_all(next.to_toml()?.as_bytes())
+                .and_then(|()| tmp.as_file().sync_all())
+                .with_context(|| format!("writing {}", tmp.path().display()))?;
+            tmp.persist(p)
+                .with_context(|| format!("replacing {}", p.display()))?;
         }
-        let tmp = p.with_extension(format!("toml.tmp{}", std::process::id()));
-        std::fs::write(&tmp, self.to_toml()?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &p).with_context(|| format!("writing {}", p.display()))?;
-        Ok(p)
+        Ok(result)
     }
 
     pub fn volume(&self, name: &str) -> Option<&Volume> {
@@ -229,8 +215,6 @@ impl Config {
         self.repos.last_mut().expect("just pushed")
     }
 
-    /// The volume a repository uses: the one its `[[repo]]` entry names, or
-    /// else the only volume configured (volumes are per user, not per repo).
     pub fn volume_for(&self, common_dir: &Path) -> Option<&Volume> {
         match self.repo(common_dir).and_then(|r| r.volume.as_deref()) {
             Some(name) => self.volume(name),
@@ -239,9 +223,6 @@ impl Config {
         }
     }
 
-    /// Whether worktrees of this repository go into its volume automatically
-    /// when the destination cannot reflink: the repository's own setting,
-    /// else the global one, else None (the user has not chosen yet).
     pub fn auto_volume_for(&self, common_dir: &Path) -> Option<bool> {
         self.repo(common_dir)
             .and_then(|r| r.auto_volume)
@@ -249,11 +230,48 @@ impl Config {
     }
 }
 
+pub fn lock_volume_setup() -> Result<File> {
+    let lock = open_lock(&required_config_path()?, ".volume-lock")?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => {
+            bail!("a sharetree volume operation is active; retry when it finishes")
+        }
+        Err(TryLockError::Error(e)) => Err(e).context("locking volume setup"),
+    }
+}
+
+pub fn lock_volume_use() -> Result<File> {
+    let lock = open_lock(&required_config_path()?, ".volume-lock")?;
+    lock.lock_shared().context("locking volume use")?;
+    Ok(lock)
+}
+
+fn required_config_path() -> Result<PathBuf> {
+    config_path().context("cannot locate the config file (set SHARETREE_CONFIG)")
+}
+
+fn open_lock(path: &Path, suffix: &str) -> Result<File> {
+    let dir = path
+        .parent()
+        .context("config path has no parent directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(suffix);
+    let lock_path = PathBuf::from(lock_path);
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))
+}
+
 fn same_path(a: &Path, b: &Path) -> bool {
     a == b || crate::util::canon(a) == crate::util::canon(b)
 }
 
-/// Parse a size such as `100G`, `512M`, `1.5T` or plain bytes (binary units).
 pub fn parse_size(s: &str) -> Result<u64> {
     let t = s.trim();
     let t = t
@@ -267,14 +285,19 @@ pub fn parse_size(s: &str) -> Result<u64> {
         Some('T' | 't') => (&t[..t.len() - 1], 1 << 40),
         _ => (t, 1),
     };
-    let v: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("not a size: {s:?} (try 100G)"))?;
-    if !(v.is_finite() && v > 0.0) {
+    let num = num.trim();
+    let invalid = || anyhow::anyhow!("not a size: {s:?} (try 100G)");
+    if let Ok(integer) = num.parse::<u64>() {
+        return integer
+            .checked_mul(mult)
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(invalid);
+    }
+    let bytes = num.parse::<f64>().map_err(|_| invalid())? * mult as f64;
+    if !(1.0..(u64::MAX as f64)).contains(&bytes) {
         bail!("not a size: {s:?}");
     }
-    Ok((v * mult as f64) as u64)
+    Ok(bytes as u64)
 }
 
 #[cfg(test)]
@@ -307,6 +330,7 @@ mod tests {
                 lower: "/d/bases/abc".into(),
                 upper: "/d/wt/fix/upper".into(),
                 work: "/d/wt/fix/work".into(),
+                phase: OverlayPhase::Ready,
             }],
         };
         c.repo_mut(Path::new("/src/app/.git")).auto_volume = Some(false);
@@ -373,5 +397,46 @@ mod tests {
         assert_eq!(parse_size("1.5T").unwrap(), 3 << 39);
         assert!(parse_size("lots").is_err());
         assert!(parse_size("-1G").is_err());
+        assert!(parse_size("0.5B").is_err());
+        assert!(parse_size("1e300T").is_err());
+        assert!(parse_size("18446744073709551616").is_err());
+        assert_eq!(parse_size("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(
+            parse_size("9007199254740993").unwrap(),
+            9_007_199_254_740_993
+        );
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_every_repository_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::thread::scope(|scope| {
+            for n in 0..12 {
+                let p = &p;
+                scope.spawn(move || {
+                    Config::update_at(p, |cfg| {
+                        cfg.repo_mut(Path::new(&format!("repo-{n}"))).auto_volume =
+                            Some(n % 2 == 0);
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(Config::load_at(&p).unwrap().repos.len(), 12);
+    }
+
+    #[test]
+    fn config_update_keeps_the_original_when_edit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "auto_volume = true\n").unwrap();
+        assert!(Config::update_at::<()>(&p, |cfg| {
+            cfg.auto_volume = Some(false);
+            bail!("edit failed")
+        })
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "auto_volume = true\n");
     }
 }

@@ -1,6 +1,3 @@
-//! Drop-in invariant scenarios (design §8.8): every `sharetree add` must produce
-//! the same worktree as stock `git worktree add`.
-
 #![cfg(unix)]
 
 mod common;
@@ -13,10 +10,7 @@ use std::path::Path;
 
 use common::*;
 
-/// Create `stock` with git and `cow` with sharetree (both detached at `rev`),
-/// assert they are equivalent, return sharetree's stderr.
 fn compare_at(sb: &Sandbox, from: &Path, rev: &str, stock: &str, cow: &str) -> String {
-    // sharetree first, so the stock worktree is never its donor.
     let err = sb.sharetree_ok(
         from,
         &["add", "--detach", &sb.p(cow).to_string_lossy(), rev],
@@ -38,10 +32,22 @@ fn compare_at(sb: &Sandbox, from: &Path, rev: &str, stock: &str, cow: &str) -> S
 
 #[test]
 fn identity() {
-    let Some(sb) = Sandbox::reflink() else { return };
+    let sb = if std::env::var("SHARETREE_REQUIRE_APFS").as_deref() == Ok("1") {
+        let sb = Sandbox::home();
+        let root = sb.root();
+        assert_eq!(
+            fs_type(root),
+            "apfs",
+            "SHARETREE_REQUIRE_APFS=1 requires the CLI identity fixture at {} to be on APFS",
+            root.display()
+        );
+        sb
+    } else {
+        let Some(sb) = Sandbox::reflink() else { return };
+        sb
+    };
     let main = sb.repo("main", &[]);
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
-    // 12 src files + big.bin + docs/readme.md + bin/tool.sh, all >= 2049 bytes.
     assert_eq!(reflinked(&err), 15, "{err}");
 }
 
@@ -57,21 +63,57 @@ fn donor_one_commit_behind() {
     let after = sb.commit_all(&main, "second");
     sb.git(&main, &["checkout", "-q", "--detach", &before]);
     let err = compare_at(&sb, &main, &after, "stock", "cow");
-    // 15 large files in the target; the rewritten and the brand-new file
-    // cannot come from the donor, the renamed one can (matched by blob id).
     assert_eq!(reflinked(&err), 13, "{err}");
+}
+
+#[test]
+fn donor_reuses_blobs_when_all_paths_are_renamed() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let before = sb.git(&main, &["rev-parse", "HEAD"]).trim().to_string();
+    fs::create_dir(main.join("renamed")).unwrap();
+    for entry in fs::read_dir(&main).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name != ".git" && name != "renamed" {
+            fs::rename(entry.path(), main.join("renamed").join(name)).unwrap();
+        }
+    }
+    let after = sb.commit_all(&main, "move all paths");
+    sb.git(&main, &["checkout", "-q", "--detach", &before]);
+    let err = compare_at(&sb, &main, &after, "stock", "cow");
+    assert_eq!(reflinked(&err), 15, "{err}");
+}
+
+#[test]
+fn ranks_donors_after_excluding_locally_modified_files() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let clean = sb.p("clean");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &clean.to_string_lossy(),
+        ],
+    );
+    write(&main.join("big.bin"), &bytes(500, 300_000));
+    let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("cow").to_string_lossy()]);
+    assert_eq!(reflinked(&err), 15, "{err}");
+    assert!(err.contains(&format!("from {}", clean.display())), "{err}");
+    assert_equivalent(&sb, &clean, &sb.p("cow"));
 }
 
 #[test]
 fn stat_clean_but_modified_donor() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
-    // Make git's stat check blind to an in-place, same-size edit.
     sb.git(&main, &["config", "core.trustctime", "false"]);
     sb.git(&main, &["config", "core.checkStat", "minimal"]);
     let f = main.join("big.bin");
-    // An old mtime, recorded in a freshly written index, so the entry is not
-    // racily clean (git would re-hash a racy entry and notice the edit).
     let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
     fs::File::options()
         .write(true)
@@ -109,7 +151,6 @@ fn dirty_donor() {
     fs::set_permissions(main.join("big.bin"), fs::Permissions::from_mode(0o755)).unwrap();
     write(&main.join("untracked.bin"), &bytes(6, 9000));
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
-    // 3 dirty paths are excluded (a mode-only change also counts as dirty).
     assert_eq!(reflinked(&err), 12, "{err}");
     assert!(!sb.p("cow/untracked.bin").exists());
 }
@@ -124,7 +165,6 @@ fn exec_bit_change() {
     let after = sb.commit_all(&main, "modes");
     sb.git(&main, &["checkout", "-q", "--detach", &before]);
     let err = compare_at(&sb, &main, &after, "stock", "cow");
-    // Same blobs, so they are reused with the target's mode.
     assert_eq!(reflinked(&err), 15, "{err}");
     let m = |p: &str| fs::metadata(sb.p(p)).unwrap().permissions().mode() & 0o777;
     assert_eq!(m("cow/big.bin"), m("stock/big.bin"));
@@ -176,7 +216,6 @@ fn sparse_checkout() {
     let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
     assert!(!sb.p("cow/src/mod3").exists());
     assert!(sb.p("cow/src/mod2/data2.bin").exists());
-    // src/mod2 + bin/tool.sh + top-level files in the cone (big.bin).
     assert_eq!(reflinked(&err), 3, "{err}");
 }
 
@@ -200,7 +239,6 @@ fn crlf_and_text_attributes() {
         .unwrap()
         .windows(2)
         .any(|w| w == b"\r\n"));
-    // crlf.txt is converted on checkout, so git writes it; the others are raw.
     assert_eq!(reflinked(&err), 17, "{err}");
 }
 
@@ -223,7 +261,6 @@ fn autocrlf_true_delegates_text_files() {
 
 #[test]
 fn smudge_filter_paths_are_left_to_git() {
-    // Stands in for LFS: a filter whose checkout output differs from the blob.
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
     sb.git(&main, &["config", "filter.upper.smudge", "tr a-z A-Z"]);
@@ -231,7 +268,6 @@ fn smudge_filter_paths_are_left_to_git() {
     let text: Vec<u8> = (0..500)
         .flat_map(|i| format!("lower case {i}\n").into_bytes())
         .collect();
-    // `*.po` names a driver nobody configured: git ignores it, so it is raw.
     write(
         &main.join(".gitattributes"),
         b"*.up filter=upper\n*.po filter=gettext-no-location\n",
@@ -266,7 +302,8 @@ fn sha256_repository() {
 fn non_utf8_and_awkward_names() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
-    let names: [&[u8]; 6] = [
+    let names: &[&[u8]] = &[
+        #[cfg(not(target_os = "macos"))]
         b"caf\xe9.bin",
         b"with\nnewline.bin",
         b"\"quoted\".bin",
@@ -300,6 +337,29 @@ fn destination_inside_source() {
 }
 
 #[test]
+fn destination_resolves_parent_after_symlink() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    fs::create_dir_all(sb.p("real/child")).unwrap();
+    std::os::unix::fs::symlink(sb.p("real/child"), sb.p("alias")).unwrap();
+    let stock = sb.p("alias/../stock");
+    let cow = sb.p("alias/../cow");
+    let err = sb.sharetree_ok(&main, &["add", "--detach", &cow.to_string_lossy()]);
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &stock.to_string_lossy(),
+        ],
+    );
+    assert_eq!(reflinked(&err), 15, "{err}");
+    assert_equivalent(&sb, &sb.p("real/stock"), &sb.p("real/cow"));
+}
+
+#[test]
 fn new_branch_and_dwim_branch() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
@@ -321,13 +381,41 @@ fn new_branch_and_dwim_branch() {
         sb.git(&sb.p("cow"), &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/c1"
     );
-    // No commit-ish and no -b: git names the branch after the directory.
     sb.sharetree_ok(&main, &["add", &sb.p("feature").to_string_lossy()]);
     assert_eq!(
         sb.git(&sb.p("feature"), &["symbolic-ref", "HEAD"]).trim(),
         "refs/heads/feature"
     );
     assert_equivalent(&sb, &sb.p("stock"), &sb.p("feature"));
+}
+
+#[test]
+fn bundled_short_options_preserve_branch_arguments_and_quiet() {
+    let sb = Sandbox::home();
+    let main = sb.repo("main", &[]);
+
+    for (branch, options, no_cow) in [
+        ("separate", &["-qb", "separate"][..], false),
+        ("attached", &["-fqBattached"][..], false),
+        ("fallback", &["-qB", "fallback"][..], true),
+    ] {
+        let dest = sb.p(branch);
+        let dest_arg = dest.to_string_lossy();
+        let mut args = vec!["add"];
+        if no_cow {
+            args.push("--no-cow");
+        }
+        args.extend_from_slice(options);
+        args.extend([dest_arg.as_ref(), "HEAD"]);
+
+        let err = sb.sharetree_ok(&main, &args);
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(
+            sb.git(&dest, &["symbolic-ref", "HEAD"]).trim(),
+            format!("refs/heads/{branch}")
+        );
+        assert_equivalent(&sb, &main, &dest);
+    }
 }
 
 #[test]
@@ -339,7 +427,6 @@ fn donor_is_another_linked_worktree() {
     write(&w1.join("src/mod0/data0.bin"), &bytes(31, 6000));
     sb.git(&w1, &["commit", "-qam", "on w1"]);
     let rev = sb.git(&w1, &["rev-parse", "HEAD"]).trim().to_string();
-    // From inside w1, w1 is the preferred donor.
     sb.git(
         &w1,
         &[
@@ -414,15 +501,44 @@ fn rejected_seed_index_falls_back_to_plain_checkout() {
             &sb.p("stock").to_string_lossy(),
         ],
     );
+    let shim = sb.p("git-shim");
+    let git = shim.join("git");
+    let marker = sb.p("index-corrupted");
+    write(
+        &git,
+        br#"#!/bin/sh
+set -eu
+export PATH="$SHARETREE_TEST_GIT_PATH"
+for arg do
+    if [ "$arg" = reset ] && [ ! -e "$SHARETREE_TEST_MARKER" ]; then
+        index=$(git rev-parse --path-format=absolute --git-path index)
+        test -s "$index"
+        printf 'invalid index' >"$index"
+        : >"$SHARETREE_TEST_MARKER"
+        break
+    fi
+done
+exec git "$@"
+"#,
+    );
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap();
+    let patched_path =
+        std::env::join_paths(std::iter::once(shim).chain(std::env::split_paths(&original_path)))
+            .unwrap();
     let out = sb
         .sharetree_cmd(&main)
-        .env("SHARETREE_TEST_CORRUPT_INDEX", "1")
+        .env("PATH", patched_path)
+        .env("SHARETREE_TEST_GIT_PATH", original_path)
+        .env("SHARETREE_TEST_MARKER", &marker)
         .args(["add", "--detach", &sb.p("cow").to_string_lossy()])
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
+    assert!(marker.is_file(), "{err}");
     assert!(err.contains("retrying a plain checkout"), "{err}");
+    assert!(err.contains("reflinked 0 of"), "{err}");
     assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
 }
 
@@ -468,6 +584,100 @@ fn post_checkout_hook_gets_stock_arguments() {
 }
 
 #[test]
+fn failed_checkout_removes_locked_worktree_and_keeps_branch() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join(".gitattributes"), b"big.bin filter=broken\n");
+    sb.commit_all(&main, "require a filter");
+    sb.git(&main, &["config", "filter.broken.smudge", "false"]);
+    sb.git(&main, &["config", "filter.broken.required", "true"]);
+    install_hook(&main, "post-checkout", "touch hook-ran");
+    let stock = sb.git_raw(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "stock",
+            "--lock",
+            &sb.p("stock").to_string_lossy(),
+        ],
+    );
+    let cow = sb.sharetree(
+        &main,
+        &["add", "-b", "cow", "--lock", &sb.p("cow").to_string_lossy()],
+    );
+    let stderr = String::from_utf8_lossy(&cow.stderr);
+    assert!(!stock.status.success());
+    assert_eq!(stock.status.code(), cow.status.code(), "{stderr}");
+    assert_eq!(
+        stderr.matches("smudge filter broken failed").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!sb.p("stock").exists());
+    assert!(!sb.p("cow").exists());
+    let worktrees = sb.git(&main, &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+    assert_eq!(
+        sb.git(&main, &["rev-parse", "refs/heads/stock"]),
+        sb.git(&main, &["rev-parse", "refs/heads/cow"])
+    );
+}
+
+#[test]
+fn failed_post_checkout_hook_keeps_worktree() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    install_hook(&main, "post-checkout", "exit 42");
+    let cow = sb.sharetree(&main, &["add", "--detach", &sb.p("cow").to_string_lossy()]);
+    let stderr = String::from_utf8_lossy(&cow.stderr);
+    assert_eq!(cow.status.code(), Some(42), "{stderr}");
+    assert_eq!(reflinked(&stderr), 15, "{stderr}");
+    let worktrees = sb.git(&main, &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 2, "{worktrees}");
+}
+
+#[test]
+fn explicit_git_worktree_never_resets_the_source() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let before = sb.git(&main, &["rev-parse", "HEAD"]).trim().to_string();
+    write(&main.join("big.bin"), b"new commit");
+    let after = sb.commit_all(&main, "second");
+    write(&main.join("big.bin"), b"uncommitted source edit");
+    let stock = sb.p("stock");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &stock.to_string_lossy(),
+            &before,
+        ],
+    );
+    let cow = sb.p("cow");
+    let out = sb
+        .sharetree_cmd(&main)
+        .env("GIT_DIR", main.join(".git"))
+        .env("GIT_WORK_TREE", &main)
+        .args(["add", "--detach", &cow.to_string_lossy(), &before])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("GIT_DIR is set"), "{stderr}");
+    assert_eq!(
+        fs::read(main.join("big.bin")).unwrap(),
+        b"uncommitted source edit"
+    );
+    assert_eq!(sb.git(&main, &["rev-parse", "HEAD"]).trim(), after);
+    assert_equivalent(&sb, &stock, &cow);
+}
+
+#[test]
 fn reference_transaction_hook_delegates() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
@@ -491,6 +701,48 @@ fn reference_transaction_hook_delegates() {
 }
 
 #[test]
+fn registration_lock_failure_stops_quiet_add_before_registration() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let dest = sb.p("cow");
+    let worktrees = sb.git(&main, &["worktree", "list", "--porcelain"]);
+    fs::create_dir(main.join(".git/sharetree-register.lock")).unwrap();
+
+    let out = sb.sharetree(&main, &["add", "-q", "-b", "cow", &dest.to_string_lossy()]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("cannot lock worktree registration"), "{err}");
+    assert!(err.contains("sharetree-register.lock"), "{err}");
+    assert!(!dest.exists());
+    assert_eq!(
+        sb.git(&main, &["worktree", "list", "--porcelain"]),
+        worktrees
+    );
+    assert!(sb.git(&main, &["branch", "--list", "cow"]).is_empty());
+}
+
+#[test]
+fn relative_hooks_path_resolves_from_worktree_root() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let hooks = main.join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    write(&hook, b"#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    sb.git(&main, &["config", "core.hooksPath", "hooks"]);
+
+    let err = sb.sharetree_ok(
+        &main.join("src"),
+        &["add", "--detach", &sb.p("cow").to_string_lossy()],
+    );
+    assert!(
+        err.contains("a reference-transaction hook is installed"),
+        "{err}"
+    );
+}
+
+#[test]
 fn passthrough_cases_delegate() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);
@@ -508,7 +760,6 @@ fn passthrough_cases_delegate() {
     sb.git(&main, &["config", "core.splitIndex", "true"]);
     let err = sb.sharetree_ok(&main, &["add", "--detach", &sb.p("si").to_string_lossy()]);
     assert!(err.contains("core.splitIndex"), "{err}");
-    // Errors from git surface unchanged.
     let out = sb.sharetree(&main, &["add", "--detach", &sb.p("si").to_string_lossy()]);
     assert!(!out.status.success());
 }

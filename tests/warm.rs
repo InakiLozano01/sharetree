@@ -1,5 +1,3 @@
-//! `add --warm`: ignored build caches, reflink only, with policy and vetoes.
-
 #![cfg(unix)]
 
 mod common;
@@ -58,7 +56,6 @@ fn cache_repo(sb: &Sandbox) -> std::path::PathBuf {
     )
     .unwrap();
     set_old_mtime(&main.join("target/debug/app"));
-    // A python venv nested deeper inside an otherwise cloned cache.
     write(&main.join("target/py/pyvenv.cfg"), b"x");
     write(&main.join("debug.log"), b"log");
     main
@@ -78,7 +75,6 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         fs::read(cow.join("node_modules/pkg/index.js")).unwrap(),
         bytes(1, 20_000)
     );
-    // Absolute links into the donor point into the new worktree.
     assert_eq!(
         fs::read_link(cow.join("node_modules/.bin/abs")).unwrap(),
         cow.join("node_modules/pkg/index.js")
@@ -91,14 +87,12 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         fs::read_link(cow.join("node_modules/.bin/outside")).unwrap(),
         Path::new("/usr/bin/env")
     );
-    // mtime and mode kept (build tools compare them).
     let a = fs::metadata(main.join("target/debug/app")).unwrap();
     let b = fs::metadata(cow.join("target/debug/app")).unwrap();
     assert_eq!(
         (a.mtime(), a.mode() & 0o7777),
         (b.mtime(), b.mode() & 0o7777)
     );
-    // Vetoed.
     for p in [".venv", "build", ".env", ".env.local", "target/py"] {
         assert!(!cow.join(p).exists(), "{p} must not be cloned");
     }
@@ -106,9 +100,7 @@ fn warm_clones_caches_and_vetoes_non_relocatable_paths() {
         err.contains("pyvenv.cfg") && err.contains("CMakeCache.txt") && err.contains(".env"),
         "{err}"
     );
-    // Tracked content still equals a stock worktree's, and is clean.
     assert!(sb.git(&cow, &["status", "--porcelain"]).is_empty());
-    // Write isolation for caches too.
     fs::write(cow.join("node_modules/pkg/index.js"), b"edited").unwrap();
     assert_eq!(
         fs::read(main.join("node_modules/pkg/index.js")).unwrap(),
@@ -135,6 +127,95 @@ fn warm_policy_selects_and_skips() {
     assert!(!cow.join("debug.log").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn warm_rollback_removes_clones_from_a_tracked_directory() {
+    let Some(sb) = Sandbox::btrfs() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join(".gitignore"), b"/tracked/cache/\n/z-long-link\n");
+    write(&main.join("tracked/original"), b"keep\n");
+    sb.commit_all(&main, "track the cache parent");
+
+    let cache = main.join("tracked/cache");
+    let artifact_path = cache.join("artifact");
+    let artifact = bytes(17, 8192);
+    write(&artifact_path, &artifact);
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o750)).unwrap();
+
+    let warmed = sb.p("warmed");
+    let warm_report = sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            main.to_str().unwrap(),
+            warmed.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        warm_report.contains("sharetree: warm: reflinked 1 files "),
+        "{warm_report}"
+    );
+    assert_eq!(
+        fs::read(warmed.join("tracked/cache/artifact")).unwrap(),
+        artifact
+    );
+    let mode = |path| fs::metadata(path).unwrap().mode() & 0o7777;
+    assert_eq!(mode(warmed.join("tracked/cache")), 0o750);
+    let tracked_mode = mode(warmed.join("tracked"));
+
+    let long_link = main.join("z-long-link");
+    let mut min_padding = 1;
+    let mut max_padding = libc::PATH_MAX as usize - main.as_os_str().len() - 2;
+    while min_padding < max_padding {
+        let padding = min_padding + (max_padding - min_padding).div_ceil(2);
+        match std::os::unix::fs::symlink(main.join("x".repeat(padding)), &long_link) {
+            Ok(()) => {
+                fs::remove_file(&long_link).unwrap();
+                min_padding = padding;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENAMETOOLONG) => max_padding = padding - 1,
+            Err(e) => panic!("probing Btrfs symlink size: {e}"),
+        }
+    }
+    std::os::unix::fs::symlink(main.join("x".repeat(min_padding)), long_link).unwrap();
+    let dest = sb.p("rollback");
+    let out = sb.sharetree(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            main.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("--warm failed (partial clones removed)"),
+        "{err}"
+    );
+    assert!(
+        err.lines()
+            .any(|line| line == "file clones rolled back = 1"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("(os error {})", libc::ENAMETOOLONG)),
+        "{err}"
+    );
+
+    assert_eq!(fs::read(dest.join("tracked/original")).unwrap(), b"keep\n");
+    assert_eq!(mode(dest.join("tracked")), tracked_mode);
+    assert!(!dest.join("tracked/cache").exists());
+    assert_eq!(fs::read(artifact_path).unwrap(), artifact);
+    eprint!("{warm_report}{err}");
+}
+
 #[test]
 fn warm_skips_other_worktrees_nested_in_the_donor() {
     let Some(sb) = Sandbox::reflink() else { return };
@@ -144,4 +225,54 @@ fn warm_skips_other_worktrees_nested_in_the_donor() {
     let err = sb.sharetree_ok(&main, &["add", "--warm", "--detach", ".worktrees/b"]);
     assert!(!main.join(".worktrees/b/.worktrees").exists(), "{err}");
     assert!(main.join(".worktrees/b/node_modules/pkg/index.js").exists());
+    let dest = sb.p("using-nested-donor");
+    sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            ".worktrees/b",
+            &dest.to_string_lossy(),
+        ],
+    );
+    assert!(dest.join("node_modules/pkg/index.js").exists());
+}
+
+#[test]
+fn warm_preserves_a_tracked_symlink_to_an_external_directory() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join(".gitignore"), b"nested/cache/\n");
+    write(&main.join("nested/tracked"), b"tracked\n");
+    sb.commit_all(&main, "add ignored cache policy");
+    write(&main.join("nested/cache/asset"), &bytes(14, 32_000));
+
+    let outside = sb.p("outside");
+    fs::create_dir(&outside).unwrap();
+    let editor = sb.p("editor");
+    sb.git(
+        &main,
+        &["worktree", "add", "--detach", editor.to_str().unwrap()],
+    );
+    fs::remove_dir_all(editor.join("nested")).unwrap();
+    std::os::unix::fs::symlink(&outside, editor.join("nested")).unwrap();
+    let target = sb.commit_all(&editor, "replace directory with link");
+
+    let dest = sb.p("warm");
+    sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--detach",
+            "--from",
+            main.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            &target,
+        ],
+    );
+    assert_eq!(fs::read_link(dest.join("nested")).unwrap(), outside);
+    assert!(!outside.join("cache").exists());
 }

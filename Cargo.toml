@@ -19,7 +19,6 @@ path = "src/lib.rs"
 name = "sharetree"
 path = "src/main.rs"
 
-# Same program under the name git looks for, so `git sharetree add ...` works.
 [[bin]]
 name = "git-sharetree"
 path = "src/bin/git-sharetree.rs"
@@ -31,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 sha1-checked = { version = "0.10", default-features = false, features = ["std"] }
 sha2 = "0.10"
+tempfile = "3"
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -41,9 +41,6 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
 ] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

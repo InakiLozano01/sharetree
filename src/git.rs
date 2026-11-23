@@ -1,7 +1,3 @@
-//! Thin wrappers around the `git` executable. sharetree reimplements only
-//! two small pieces of git: the v2 index writer (`index.rs`) and blob
-//! hashing (`hash.rs`).
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -15,14 +11,29 @@ use crate::util::bytes_to_path;
 pub const MODE_REGULAR: u32 = 0o100644;
 pub const MODE_EXEC: u32 = 0o100755;
 
+pub(crate) fn context_override() -> Option<&'static str> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_GRAFT_FILE",
+        "GIT_SHALLOW_FILE",
+    ]
+    .into_iter()
+    .find(|var| std::env::var_os(var).is_some())
+}
+
 pub fn cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.current_dir(dir);
     c
 }
 
-/// A read-only git invocation: never takes optional locks (so `status` and
-/// friends do not rewrite a donor's index behind its owner's back).
 pub fn read_cmd(dir: &Path) -> Command {
     let mut c = cmd(dir);
     c.env("GIT_OPTIONAL_LOCKS", "0");
@@ -36,7 +47,6 @@ fn describe<S: AsRef<OsStr>>(args: &[S]) -> String {
         .join(" ")
 }
 
-/// Run git, capture stdout, fail with git's stderr on a non-zero exit.
 pub fn output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>> {
     let out = read_cmd(dir)
         .args(args)
@@ -60,8 +70,6 @@ pub fn output_str<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String> {
         .to_string())
 }
 
-/// Run git with `input` on stdin (written from a separate thread so a large
-/// input cannot deadlock against a large output).
 pub fn output_with_input<S: AsRef<OsStr>>(dir: &Path, args: &[S], input: &[u8]) -> Result<Vec<u8>> {
     let mut child = read_cmd(dir)
         .args(args)
@@ -87,12 +95,10 @@ pub fn output_with_input<S: AsRef<OsStr>>(dir: &Path, args: &[S], input: &[u8]) 
     Ok(out.stdout)
 }
 
-/// Run git with inherited stdio (the user sees git's own messages).
 pub fn run_inherit<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<ExitStatus> {
     cmd(dir).args(args).status().context("failed to run git")
 }
 
-/// Run git quietly and report whether it succeeded.
 pub fn succeeds<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> bool {
     read_cmd(dir)
         .args(args)
@@ -122,7 +128,7 @@ pub fn common_dir(dir: &Path) -> Result<PathBuf> {
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn git_path(dir: &Path, name: &str) -> Result<PathBuf> {
@@ -130,12 +136,12 @@ pub fn git_path(dir: &Path, name: &str) -> Result<PathBuf> {
         dir,
         &["rev-parse", "--path-format=absolute", "--git-path", name],
     )?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
     let s = output(dir, &["rev-parse", "--show-toplevel"])?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn trim_nl(b: &[u8]) -> &[u8] {
@@ -146,17 +152,20 @@ pub fn trim_nl(b: &[u8]) -> &[u8] {
     &b[..end]
 }
 
-/// `git config --get`, with "unset" (exit 1) mapped to None.
 pub fn config_get(dir: &Path, key: &str) -> Result<Option<String>> {
     let out = read_cmd(dir)
-        .args(["config", "--get", key])
+        .args(["config", "-z", "--get", key])
         .stdin(Stdio::null())
         .output()
         .context("failed to run git config")?;
     match out.status.code() {
-        Some(0) => Ok(Some(
-            String::from_utf8_lossy(trim_nl(&out.stdout)).into_owned(),
-        )),
+        Some(0) => {
+            let value = out
+                .stdout
+                .strip_suffix(b"\0")
+                .context("unterminated git config value")?;
+            Ok(Some(String::from_utf8_lossy(value).into_owned()))
+        }
         Some(1) => Ok(None),
         _ => bail!(
             "git config --get {key}: {}",
@@ -204,9 +213,6 @@ pub fn object_format(dir: &Path) -> Result<ObjectFormat> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Worktrees
-
 #[derive(Clone, Debug, Default)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -225,8 +231,6 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&out))
 }
 
-/// Parse `git worktree list --porcelain -z`: NUL-terminated fields, records
-/// separated by an empty field. Paths are kept as raw bytes.
 pub fn parse_worktrees(out: &[u8]) -> Vec<Worktree> {
     let mut wts = Vec::new();
     let mut cur: Option<Worktree> = None;
@@ -270,9 +274,6 @@ pub fn parse_worktrees(out: &[u8]) -> Vec<Worktree> {
     wts
 }
 
-// ---------------------------------------------------------------------------
-// Trees
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub mode: u32,
@@ -286,7 +287,6 @@ impl Entry {
     }
 }
 
-/// Every blob and gitlink of a commit, keyed by raw path bytes.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
     pub entries: HashMap<Vec<u8>, Entry>,
@@ -298,7 +298,6 @@ impl Tree {
     }
 }
 
-/// `git ls-tree -r -l -z <rev>`: "<mode> SP <type> SP <oid> SP+ <size> TAB <path>".
 pub fn ls_tree(dir: &Path, rev: &str) -> Result<Tree> {
     let out = output(dir, &["ls-tree", "-r", "-l", "-z", rev])?;
     parse_ls_tree(&out)
@@ -338,7 +337,6 @@ pub fn parse_ls_tree(out: &[u8]) -> Result<Tree> {
     Ok(tree)
 }
 
-/// Stage-0 entries of a worktree's index: `git ls-files -s -z`.
 pub fn ls_files_stage(dir: &Path) -> Result<Vec<(Vec<u8>, u32, String)>> {
     let out = output(dir, &["ls-files", "-s", "-z"])?;
     let mut v = Vec::new();
@@ -365,7 +363,60 @@ pub fn ls_files_stage(dir: &Path) -> Result<Vec<(Vec<u8>, u32, String)>> {
     Ok(v)
 }
 
-/// Split NUL-terminated output into owned records.
+pub fn changed_tracked_paths(
+    dir: &Path,
+    include_staged: bool,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    changed_tracked_paths_impl(dir, include_staged, &[])
+}
+
+#[cfg(target_os = "linux")]
+pub fn changed_tracked_paths_under(
+    dir: &Path,
+    paths: &[&[u8]],
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let args = paths
+        .iter()
+        .map(|path| {
+            let mut spec = b":(top,literal)".to_vec();
+            spec.extend_from_slice(path);
+            OsString::from_vec(spec)
+        })
+        .collect::<Vec<_>>();
+    changed_tracked_paths_impl(dir, false, &args)
+}
+
+fn changed_tracked_paths_impl(
+    dir: &Path,
+    include_staged: bool,
+    pathspecs: &[OsString],
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let mut args = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "-uno",
+        "--no-renames",
+        "--",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.extend_from_slice(pathspecs);
+    let out = output(dir, &args)?;
+    let mut paths = std::collections::HashSet::new();
+    for record in split_z(&out) {
+        if record.len() < 4 || record[2] != b' ' {
+            bail!("unexpected Git status record in {}", dir.display());
+        }
+        if include_staged || record[1] != b' ' {
+            paths.insert(record[3..].to_vec());
+        }
+    }
+    Ok(paths)
+}
+
 pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
     out.split(|&b| b == 0)
         .filter(|r| !r.is_empty())
@@ -373,20 +424,8 @@ pub fn split_z(out: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Whether a hook would run: honours core.hooksPath like git does.
 pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
-    let dir = match config_get(worktree, "core.hooksPath")? {
-        Some(p) => {
-            let p = expand_tilde(&p);
-            if p.is_absolute() {
-                p
-            } else {
-                worktree.join(p)
-            }
-        }
-        None => common_dir(worktree)?.join("hooks"),
-    };
-    let hook = dir.join(name);
+    let hook = git_path(worktree, &format!("hooks/{name}"))?;
     let Ok(md) = hook.metadata() else {
         return Ok(false);
     };
@@ -399,18 +438,19 @@ pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
     Ok(md.is_file())
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_newlines_in_worktree_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("checkout\r\n");
+        std::fs::create_dir(&root).unwrap();
+        output(&root, &["init", "-q"]).unwrap();
+        assert_eq!(toplevel(&root).unwrap(), root);
+    }
 
     #[test]
     fn parses_worktree_porcelain() {

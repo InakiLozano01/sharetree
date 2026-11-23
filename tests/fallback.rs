@@ -1,8 +1,9 @@
-//! No-reflink paths: everything must fall back to stock `git worktree add`.
-
 #![cfg(unix)]
 
 mod common;
+
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 use common::*;
 
@@ -27,6 +28,7 @@ fn tmpfs_falls_back_to_git_worktree_add() {
     );
     assert!(err.contains("running plain `git worktree add`"), "{err}");
     assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+    eprint!("{err}");
 }
 
 #[test]
@@ -45,6 +47,7 @@ fn warm_on_tmpfs_copies_nothing() {
         !sb.p("cow/node_modules").exists(),
         "caches must never be byte-copied"
     );
+    eprint!("{err}");
 }
 
 #[test]
@@ -53,6 +56,12 @@ fn destination_on_another_filesystem_falls_back() {
         return;
     };
     let Some(tmp) = Sandbox::tmpfs() else { return };
+    let native_device = fs::metadata(home.root()).unwrap().dev();
+    let tmpfs_device = fs::metadata(tmp.root()).unwrap().dev();
+    assert_ne!(
+        native_device, tmpfs_device,
+        "fixtures must be on distinct devices"
+    );
     let main = home.repo("main", &[]);
     home.git(
         &main,
@@ -67,6 +76,7 @@ fn destination_on_another_filesystem_falls_back() {
     let err = home.sharetree_ok(&main, &["add", "--detach", &tmp.p("cow").to_string_lossy()]);
     assert!(err.contains("running plain `git worktree add`"), "{err}");
     assert_equivalent(&home, &tmp.p("stock"), &tmp.p("cow"));
+    eprint!("{err}");
 }
 
 #[test]

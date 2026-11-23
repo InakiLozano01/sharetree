@@ -1,5 +1,3 @@
-//! Test harness: sandboxed git (no user/system config), repos on a chosen
-//! filesystem, and a drop-in comparison against stock `git worktree add`.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -12,7 +10,15 @@ use std::process::{Command, Output, Stdio};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_sharetree");
 
-/// Filesystem type name of `p` (`stat -f -c %T`).
+pub fn require_btrfs() -> bool {
+    std::env::var("SHARETREE_REQUIRE_BTRFS").as_deref() == Ok("1")
+}
+
+fn require_xfs() -> bool {
+    std::env::var("SHARETREE_REQUIRE_XFS").as_deref() == Ok("1")
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn fs_type(p: &Path) -> String {
     let out = Command::new("stat")
         .args(["-f", "-c", "%T"])
@@ -20,6 +26,19 @@ pub fn fs_type(p: &Path) -> String {
         .output()
         .expect("stat");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[cfg(target_os = "macos")]
+pub fn fs_type(p: &Path) -> String {
+    let path = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return std::io::Error::last_os_error().to_string();
+    }
+    let stat = unsafe { stat.assume_init() };
+    unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub struct Sandbox {
@@ -44,37 +63,78 @@ impl Sandbox {
         Sandbox { dir, home }
     }
 
-    /// Under the target dir: on this host that is Btrfs /home, not tmpfs /tmp.
     pub fn home() -> Sandbox {
         Sandbox::new_in(Path::new(env!("CARGO_TARGET_TMPDIR")))
     }
 
-    /// Sandbox on a filesystem that supports reflinks, or None (skip).
     pub fn reflink() -> Option<Sandbox> {
+        Sandbox::native_fixture(&["btrfs", "xfs", "apfs"])
+    }
+
+    pub fn btrfs() -> Option<Sandbox> {
+        Sandbox::native_fixture(&["btrfs"])
+    }
+
+    fn native_fixture(filesystems: &[&str]) -> Option<Sandbox> {
         let sb = Sandbox::home();
         let t = fs_type(sb.root());
-        if t == "btrfs" || t == "xfs" {
+        let required = if require_btrfs() {
+            Some("btrfs")
+        } else if require_xfs() {
+            Some("xfs")
+        } else {
+            None
+        };
+        if let Some(expected) = required {
+            assert_eq!(
+                t,
+                expected,
+                "required {expected} fixture at {}",
+                sb.root().display()
+            );
+            eprintln!("{expected} fixture: {}", sb.root().display());
+        }
+        if filesystems.contains(&t.as_str()) {
             Some(sb)
         } else {
             eprintln!(
-                "SKIP: {} is {t}, not a reflink filesystem",
-                sb.root().display()
+                "SKIP: {} is {t}, requires one of {filesystems:?}",
+                sb.root().display(),
             );
             None
         }
     }
 
-    /// Sandbox on /tmp when it is tmpfs (no reflinks), or None (skip).
     pub fn tmpfs() -> Option<Sandbox> {
-        let t = fs_type(Path::new("/tmp"));
+        let fixture = std::env::var_os("SHARETREE_TEST_TMPFS_DIR");
+        assert!(
+            !require_xfs() || fixture.is_some(),
+            "SHARETREE_REQUIRE_XFS=1 requires SHARETREE_TEST_TMPFS_DIR"
+        );
+        let base = fixture.as_deref().map_or(Path::new("/tmp"), Path::new);
+        let t = fs_type(base);
         if t != "tmpfs" {
-            eprintln!("SKIP: /tmp is {t}, not tmpfs");
+            assert!(
+                fixture.is_none(),
+                "SHARETREE_TEST_TMPFS_DIR requires tmpfs at {}, found {t:?}",
+                base.display()
+            );
+            eprintln!("SKIP: {} is {t}, not tmpfs", base.display());
             return None;
         }
-        Some(Sandbox::new_in(Path::new("/tmp")))
+        let sb = Sandbox::new_in(base);
+        if fixture.is_some() {
+            assert_eq!(
+                fs_type(sb.root()),
+                "tmpfs",
+                "fixture at {}",
+                sb.root().display()
+            );
+            eprintln!("tmpfs fixture: {}", sb.root().display());
+        }
+        Some(sb)
     }
 
-    /// The sandbox's `$XDG_CONFIG_HOME/sharetree/config.toml`.
     pub fn config_path(&self) -> PathBuf {
         self.home.join(".config/sharetree/config.toml")
     }
@@ -87,7 +147,7 @@ impl Sandbox {
         self.root().join(rel)
     }
 
-    fn env(&self, c: &mut Command) {
+    pub(super) fn env(&self, c: &mut Command) {
         c.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
@@ -152,7 +212,6 @@ impl Sandbox {
             .unwrap()
     }
 
-    /// sharetree that must succeed; returns stderr.
     pub fn sharetree_ok<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> String {
         let out = self.sharetree(dir, args);
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -164,7 +223,6 @@ impl Sandbox {
         err
     }
 
-    /// A repository with a representative mix of tracked content.
     pub fn repo(&self, name: &str, init_args: &[&str]) -> PathBuf {
         let r = self.p(name);
         fs::create_dir_all(&r).unwrap();
@@ -184,7 +242,6 @@ impl Sandbox {
     }
 }
 
-/// Deterministic pseudo-random bytes.
 pub fn bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..len)
@@ -204,8 +261,6 @@ pub fn write(p: &Path, data: &[u8]) {
     fs::write(p, data).unwrap();
 }
 
-/// Files above and below the clone threshold, nested dirs, an exec file, an
-/// empty file, relative symlinks.
 pub fn populate(r: &Path) {
     for i in 0..12u64 {
         write(
@@ -230,7 +285,6 @@ pub enum Node {
     Link(PathBuf),
 }
 
-/// Every path under a worktree except its top-level `.git`.
 pub fn snapshot(root: &Path) -> BTreeMap<Vec<u8>, Node> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<Vec<u8>, Node>) {
         for e in fs::read_dir(dir).unwrap() {
@@ -262,9 +316,6 @@ pub fn snapshot(root: &Path) -> BTreeMap<Vec<u8>, Node> {
     m
 }
 
-/// The drop-in invariant: files, modes, links, HEAD, index entries and
-/// `git status` equal those of a stock worktree; and the index's stat data
-/// is valid (no rehash needed on first status).
 pub fn assert_equivalent(sb: &Sandbox, stock: &Path, cow: &Path) {
     let a = snapshot(stock);
     let b = snapshot(cow);
@@ -297,8 +348,6 @@ pub fn assert_equivalent(sb: &Sandbox, stock: &Path, cow: &Path) {
         sb.git(cow, &["ls-files", "-s", "-z"]),
         "index entries"
     );
-    // Stat-valid index: diff-files does not refresh, so any entry whose stat
-    // data does not match the file would be listed.
     let df = sb.git_raw(cow, &["diff-files", "--quiet"]);
     assert!(
         df.status.success(),
@@ -318,7 +367,6 @@ pub fn assert_equivalent(sb: &Sandbox, stock: &Path, cow: &Path) {
         .success());
 }
 
-/// Parse "reflinked N of M files" from sharetree's summary.
 pub fn reflinked(stderr: &str) -> usize {
     stderr
         .lines()
@@ -331,27 +379,29 @@ pub fn reflinked(stderr: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// `btrfs filesystem du -s --raw` Exclusive bytes of the paths (summed), or
-/// None when not on Btrfs / tool missing.
 pub fn btrfs_exclusive(paths: &[PathBuf]) -> Option<u64> {
-    let _ = Command::new("sync").status();
+    if !Command::new("sync").status().ok()?.success() {
+        return None;
+    }
     let out = Command::new("btrfs")
         .args(["filesystem", "du", "-s", "--raw"])
         .args(paths)
         .output()
         .ok()?;
     if !out.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sum = 0;
+    let mut rows = 0;
     for l in text.lines().skip(1) {
         sum += l.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+        rows += 1;
     }
-    Some(sum)
+    (rows == paths.len()).then_some(sum)
 }
 
-/// Top-level entries of a worktree except `.git` (to exclude the object store).
 pub fn content_paths(root: &Path) -> Vec<PathBuf> {
     fs::read_dir(root)
         .unwrap()

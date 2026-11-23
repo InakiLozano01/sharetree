@@ -30,9 +30,11 @@ sharetree: reflinked 62408 of 97371 files (1.5 GiB) from /src/linux; git wrote t
 
 ## Install
 
-**Release binaries** (Linux x86_64/aarch64 static musl, macOS x86_64/arm64,
-Windows x86_64) are attached to each
-[GitHub release](https://github.com/InakiLozano01/sharetree/releases):
+**Release binaries** will be available from
+[GitHub Releases](https://github.com/InakiLozano01/sharetree/releases) after the
+first tag ships. The workflow builds Linux x86_64/aarch64 static musl,
+macOS x86_64/arm64, and Windows x86_64 archives. These commands verify and
+install a Linux or macOS archive once it is available.
 
 ```sh
 v=0.1.0 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, ...
@@ -43,9 +45,9 @@ tar xzf "sharetree-v$v-$target.tar.gz"
 install -m755 "sharetree-v$v-$target"/{sharetree,git-sharetree} ~/.local/bin/
 ```
 
-**Arch Linux (AUR):** `sharetree-bin` (release binaries) or `sharetree`
-(built from source), e.g. `yay -S sharetree-bin`. The PKGBUILDs live in
-[`packaging/aur/`](packaging/aur).
+**Arch Linux (AUR):** Package templates for `sharetree-bin` (release binaries)
+and `sharetree` (source) live in [`packaging/aur/`](packaging/aur). They still
+need the first release's checksums and an Arch package build.
 
 **From source** (stable Rust ≥ 1.89; sharetree is not on crates.io yet):
 
@@ -76,7 +78,7 @@ sharetree add [<git worktree add options>] [--from <worktree>] [--warm]
 sharetree rm [-f [-f]] [--sync] <worktree>
 sharetree ls [--no-size]
 sharetree du [--all] [--raw] [<path>...]
-sharetree reshare [<worktree>] [--from <worktree>] [--dry-run] [--min-size <bytes>]
+sharetree reshare [<worktree> | --all] [--from <worktree>] [--dry-run] [--min-size <bytes>]
 sharetree doctor [<path>]
 sharetree mount [--unmount] (--all | <worktree>...)
 sharetree setup volume|devdrive|status|mount|teardown|auto ...
@@ -94,7 +96,7 @@ sharetree setup volume|devdrive|status|mount|teardown|auto ...
 | `--into-volume` | Put the worktree in the sharetree volume and leave a symlink at `<path>`. See below. |
 | `--no-volume` | Never use the volume, even with `auto_volume = true`. |
 | `--overlay` | Linux, opt-in: a fuse-overlayfs worktree over a shared base checkout. See [Overlay worktrees](#linux-overlay-worktrees---overlay). |
-| `--windows-clone` | Windows, experimental and untested: ReFS / Dev Drive block cloning (also `windows_clone = true` in the config). See [Windows](#windows-block-cloning-experimental-untested). |
+| `--windows-clone` | Experimental ReFS / Dev Drive block cloning on Windows (also `windows_clone = true` in the config). See [Windows](#windows-block-cloning-experimental). |
 | `-v` | Show the donor, the plan and how long each step took. `SHARETREE_TRACE=1` does the same. |
 
 **`rm`** applies `git worktree remove`'s checks. It refuses a worktree with
@@ -123,10 +125,19 @@ builds would wait. `-q` or `SHARETREE_NO_ADVICE=1` silences the hint.
 
 **`reshare`** (Linux) gets sharing back in a worktree where git rewrote files:
 one made by plain `git worktree add`, or after a `git switch` away and back. It
-asks the kernel to deduplicate (`FIDEDUPERANGE`) each stat-clean tracked file
+asks the kernel to deduplicate (`FIDEDUPERANGE`) each unchanged tracked file
 against a donor copy of the same blob. The kernel compares the bytes itself and
-shares only if they are equal, so content cannot change. Inodes and timestamps
-stay the same, so the index stays valid and `git status` stays fast.
+shares only if they are equal, so content cannot change. Sharetree reads Git's
+index without rewriting it. Filesystems that update file timestamps during
+deduplication can make the next `git status` rehash those files once.
+
+Run `sharetree reshare --all` to scan the repository's worktrees on the current filesystem once and
+deduplicate eligible files by device, blob ID and file size. Each target
+can try up to four donor copies. `--all` takes no worktree argument or
+`--from`. Use `--dry-run` to
+count candidates before the kernel checks byte equality. Reported shared
+bytes describe file ranges. See [space accounting](#why-du-lies-and-how-to-measure)
+for physical savings.
 
 ### `--warm`: ignored build caches
 
@@ -172,7 +183,7 @@ donor scoring:
 
 1. **Preflight.** These cases go straight to plain `git worktree add`:
    - `--no-checkout` or `--orphan`;
-   - `core.splitIndex`, or `GIT_INDEX_FILE` set;
+   - `core.splitIndex`, or an explicit Git repository, worktree, index or object-store override;
    - a `reference-transaction` or `post-index-change` hook;
    - no donor on the same device;
    - Windows, unless `--windows-clone` / `windows_clone = true`.
@@ -180,10 +191,10 @@ donor scoring:
    destination. It does not trust filesystem names: XFS can be made without
    reflink support, OpenZFS gates its block cloning behind a setting, and
    overlayfs depends on the filesystem underneath.
-3. **Register.** It runs `git worktree add --no-checkout <your args>`, and
-   meanwhile ranks donors by how many `(path, blob)` entries they share with
-   the target commit. A donor whose tracked files are mostly modified is
-   skipped, since it is probably still in the middle of a checkout.
+3. **Register.** It runs `git worktree add --no-checkout <your args>` and
+   ranks donors by how many target files they can supply by blob ID. The
+   final ranking excludes donor paths with local edits. A worktree with
+   mostly modified files is likely still being populated and is skipped.
 4. **Plan.** A target file is cloned only when all of these hold:
    - it is a regular file of at least `--min-size` bytes;
    - a donor file with the same blob is unmodified (matched by blob id, so
@@ -205,13 +216,13 @@ donor scoring:
    match too, and the stat data must not move while the file is read. Any
    mismatch is deleted.
 7. **Seed the index.** sharetree writes a version 2 index listing only the
-   verified files, with their real stat data. This is the step that keeps the
-   sharing: without it, `git checkout` rewrites every clone (the research
-   notes measured 48 MiB exclusive instead of 0).
-8. **Finish.** `git checkout -f HEAD` (parallel checkout) writes everything
-   else. If git rejects the seeded index, sharetree deletes it and checks out
-   from scratch. `git hook run post-checkout` then gets the same arguments
-   `git worktree add` would pass.
+   verified files, with their real stat data. Git can leave those files in place
+   and preserve their shared blocks.
+8. **Finish.** `git reset --hard --no-recurse-submodules` writes the remaining
+   files, as in `git worktree add`. If Git rejects the seeded index, sharetree
+   retries with an empty index. A failed population rolls back the worktree
+   registration. `git hook run post-checkout` then gets the stock arguments. A
+   failing hook returns its exit code and leaves the completed worktree in place.
 
 **Why the clones are re-read.** A reflinked file starts with an empty page
 cache, even when the donor is cached, so hashing it reads the data from disk
@@ -227,11 +238,15 @@ metadata ("inline"). Those can't share blocks, so cloning them saves nothing.
 On compressed Btrfs, files of a few KiB that compress well are stored inline
 too.
 
+[Architecture decision records](docs/adr/README.md) explain the constraints
+behind checkout verification and the other worktree backends.
+
 ## Why `du` lies, and how to measure
 
 `du` adds up each file's blocks and cannot tell that two files share them. Ten
-reflinked worktrees look like ten full copies. The number that matters is
-**exclusive** bytes: what deleting the worktree would free.
+reflinked worktrees look like ten full copies. **Exclusive** bytes estimate
+the size of file extents with a single reference. Extents shared by files
+within the same worktree can also be freed when the entire worktree is removed.
 
 - **Btrfs:** `btrfs filesystem du -s <paths>` prints Total, Exclusive and Set
   shared, using the FIEMAP ioctl. Pass the worktree's top-level entries, not
@@ -242,11 +257,8 @@ reflinked worktrees look like ten full copies. The number that matters is
   is the ground truth.
 - **XFS** has no `btrfs fi du` equivalent. The FIEMAP ioctl flags every
   extent another file also references (`FIEMAP_EXTENT_SHARED`), so the sum of
-  the *unshared* extents of a worktree's files is what deleting it frees.
+  the *unshared* extents measures their exclusive bytes.
   `xfs_io -c fiemap -v <file>` shows the flags by hand.
-- **Any filesystem:** compare free space (`df`) before and after creating a
-  worktree. Run `sync` first and wait, on an otherwise idle filesystem. This
-  is the ground truth.
 - **`sharetree ls` / `sharetree du`:** `btrfs filesystem du` on Btrfs; on
   XFS and other Linux filesystems with FIEMAP, the unshared-extent sum
   above. That sum is exact for extents shared between worktrees, but it
@@ -402,7 +414,7 @@ space freed inside the volume flows back to the host after a few minutes.
 An opt-in alternative to the volume, for when a loop image is not wanted:
 `sharetree add --overlay <path> [<commit-ish>]` (any `git worktree add`
 options too) mounts a **fuse-overlayfs** worktree at `<path>`. It needs
-`fuse-overlayfs` (≥ 1.18 recommended: it fixed CVE-2026-77478), `fusermount3`
+`fuse-overlayfs` 1.18 or later (includes the fix for CVE-2026-77478), `fusermount3`
 and `/dev/fuse`; no root.
 
 - **Lower layer:** one immutable *base* checkout per commit, a detached,
@@ -440,10 +452,8 @@ and `/dev/fuse`; no root.
   **3–6x slower** than on plain ext4;
 - the worktree exists only while mounted.
 
-Use the volume for heavy builds. **Status:** unit-tested (mount options,
-version check, unit file, lock reasons) and the end-to-end test is written,
-but fuse-overlayfs is not installed on the development host, so that test
-skips there and overlay mode has **not been run**.
+Use the volume for heavy builds. Overlay creation, remounting and removal
+are tested end to end on Linux with fuse-overlayfs.
 
 ### Windows: `sharetree setup devdrive`
 
@@ -466,7 +476,11 @@ Without `--windows-clone` these are full checkouts that get Dev Drive's
 faster I/O. The script generator is unit-tested on every platform, but the
 script has **not been run** on Windows.
 
-### Windows block cloning (experimental, untested)
+`setup teardown --delete-image` checks the attached image for managed
+worktree data before deleting it. Use `--force` to delete a detached image
+or an image that still holds worktree data.
+
+### Windows block cloning (experimental)
 
 **Off by default.** `sharetree add --windows-clone ...`, or `windows_clone =
 true` in `%APPDATA%\sharetree\config.toml`, runs the same engine as on Linux
@@ -489,12 +503,34 @@ notes:
   and gid are 0, and there is no exec bit;
 - every clone is still hashed against its blob before it enters the index.
 
-**Status:** it compiles for `x86_64-pc-windows-gnu` (clippy-clean), and the
-platform-independent parts (region splitting and alignment, FILETIME to
-index stat mapping) are unit-tested on every platform. It has **never been
-run on Windows**. With Git for Windows' default `core.autocrlf = true`, text
-files are converted on checkout, so git writes those and only binary or
-`-text` files are cloned.
+Native Windows CI checks checkout contents, clean Git status, and edit
+isolation with `--no-cow` and `--windows-clone` on the runner's temporary
+filesystem. The smoke test accepts a plain Git fallback. Region splitting,
+alignment, and FILETIME-to-index stat mapping have unit tests on every
+platform.
+
+The Windows ReFS workflow provisions a disposable ReFS volume with 4 KiB
+allocation units on a GitHub-hosted Windows Server 2025 runner. It requires
+the regression below to pass as evidence of Server ReFS block cloning and
+Git-equivalent checkout behavior. Windows 11 Dev Drive setup, beyond-EOF
+behavior, and physical extent sharing require separate verification.
+
+To run the ReFS regression, set `SHARETREE_TEST_REFS_DIR` to an existing,
+writable directory on a ReFS volume with block cloning enabled. The test
+creates and cleans up a temporary repository and both worktrees inside that
+directory using your normal user account. In PowerShell, run
+
+```powershell
+$env:SHARETREE_TEST_REFS_DIR = 'D:\path\to\existing-directory'
+cargo test --locked --test windows refs_worktree_uses_verified_clones_and_keeps_edits_isolated -- --ignored --exact
+```
+
+The regression checks the filesystem type, requires one verified clone,
+compares the checkout and index with stock Git, and checks that editing the
+clone leaves the donor unchanged.
+
+With Git for Windows' default `core.autocrlf = true`, Git writes files that
+need checkout conversion. Binary or `-text` files can be cloned.
 
 ## Platform matrix
 
@@ -506,10 +542,22 @@ files are converted on checkout, so git writes those and only binary or
 | Linux | OpenZFS ≥ 2.2 with block cloning on | reflink if the probe succeeds; an EAGAIN on dirty data means git writes that file (untested here) | reflink | depends on the kernel | FIEMAP estimate |
 | Linux | ext4, tmpfs, NFS, ... | plain `git worktree add` plus a hint (tmpfs and ext4 tested) | nothing copied | no | FIEMAP estimate or n/a |
 | Linux | ext4 etc. **with `sharetree setup volume`** | `--into-volume` / `auto_volume` / the prompt: reflink inside a Btrfs or XFS loop image, with a seed donor (both tested, including ext4) | reflink inside the volume | FIDEDUPERANGE inside the volume | `btrfs filesystem du` / FIEMAP |
-| Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (written; not run here: fuse-overlayfs missing) | — | no | upper dir size |
-| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped (compiles; untested) | reflink | not yet | not measurable (use `df`) |
+| Linux | ext4, tmpfs **with `--overlay`** | fuse-overlayfs over a base checkout (tested on Linux) | — | no | upper dir size |
+| macOS | APFS | `fclonefileat` per file, then flags and xattrs stripped | reflink | not yet | not measurable (use `df`) |
 | Windows | NTFS | plain `git worktree add` plus a hint | — | no | not measurable |
-| Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | `--into-volume`: plain checkout; with `--windows-clone`, block cloning (compiles, unit-tested math; never run) | — | no | not measurable |
+| Windows | ReFS Dev Drive (**`sharetree setup devdrive`**) | Plain checkout with `--into-volume`, block cloning with `--windows-clone` (ReFS execution pending) | — | no | not measurable |
+
+Native macOS CI sets `SHARETREE_REQUIRE_APFS=1`. The CLI identity test requires
+an APFS fixture, 15 verified clones, and a checkout equivalent to stock Git.
+The separate xattr regression requires a working clone probe and verifies that
+the clone strips extended attributes. Local runs with the gate unset can skip
+these tests when their fixtures lack filesystem support.
+
+Hosted Linux CI uses separate Btrfs and XFS loop images to check verified
+clones, stock Git parity, and write isolation. The Btrfs job also checks
+exclusive bytes and warm-cache rollback. The XFS job uses a separate tmpfs
+mount to check stock Git fallback within tmpfs and from XFS to tmpfs, and
+verifies that `--warm` leaves caches behind on tmpfs.
 
 The dependency advisor (`doctor`, and the hint after `add`) works everywhere.
 sharetree has no ProjFS or hardlink backend: hardlinked tracked files leak
@@ -523,7 +571,17 @@ files, 51 MB) and torvalds/linux (97,371 files, 1.68 GB). Scripts:
 with the load average) and [`bench/bench.sh`](bench/bench.sh) (adds the
 first `git status` and exclusive bytes). "old" is the previous version of
 this code (clone everything, then `git hash-object` in 8 processes, then
-check out); "new" is the current one.
+check out); "new" is the first published source revision, 871ca1b.
+
+The comparison script accepts one argument per program with `label=program`.
+Use `--tool` to pass arguments or environment values containing spaces.
+Inside a `--tool` group, write `--tool ''` to pass a literal `--tool` argument.
+Start the next group with `--tool <label> <program>`.
+
+```sh
+bench/compare.sh ~/src/linux 5 --tool stock git \
+  --tool sharetree env SHARETREE_NO_PROMPT=1 '/path/to/sharetree build'
+```
 
 **Controlled: XFS image on tmpfs** (no disk, no compression, no encryption;
 median of 5 alternating runs):
@@ -574,8 +632,7 @@ a final `git checkout` that sometimes takes 0.3 s for no work.
 ## Limitations and roadmap
 
 - **Not yet:**
-  - running Windows block cloning and overlay mode on real systems (both
-    are written, neither has been run);
+  - running the opt-in Windows regression on a real ReFS volume;
   - kernel overlayfs in a user namespace (`sharetree exec`), ProjFS, and an
     opt-in hardlink backend;
   - growing a volume (`truncate` plus a filesystem resize, which needs

@@ -1,13 +1,9 @@
-//! Small helpers shared across commands.
-
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 static UMASK: OnceLock<u32> = OnceLock::new();
 
-/// Read the process umask once, before any thread starts: reading it means
-/// setting it, which would race with threads creating files.
 pub fn init_umask() {
     #[cfg(unix)]
     UMASK.get_or_init(|| unsafe {
@@ -46,8 +42,6 @@ pub fn path_to_bytes(p: &Path) -> Vec<u8> {
     p.to_string_lossy().replace('\\', "/").into_bytes()
 }
 
-/// Make `p` absolute against `base` and drop `.`/`..` lexically, the way git
-/// resolves a `<path>` argument before the directory exists.
 pub fn absolutize(p: &Path, base: &Path) -> PathBuf {
     let joined = if p.is_absolute() {
         p.to_path_buf()
@@ -67,8 +61,6 @@ pub fn absolutize(p: &Path, base: &Path) -> PathBuf {
     out
 }
 
-/// Identity of the filesystem holding `p` (a reflink cannot cross it):
-/// `st_dev` on Unix, the volume serial number on Windows.
 #[cfg(unix)]
 pub fn device_id(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -85,8 +77,6 @@ pub fn device_id(_p: &Path) -> Option<u64> {
     None
 }
 
-/// Does the file's exec bit match the tree mode? Windows has none (git
-/// there runs with core.fileMode = false), so anything matches.
 #[cfg(unix)]
 pub fn exec_bit_matches(m: &std::fs::Metadata, exec: bool) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -98,7 +88,6 @@ pub fn exec_bit_matches(_m: &std::fs::Metadata, _exec: bool) -> bool {
     true
 }
 
-/// The deepest ancestor of `p` (or `p` itself) that exists.
 pub fn nearest_existing(p: &Path) -> PathBuf {
     let mut cur = p.to_path_buf();
     loop {
@@ -111,7 +100,6 @@ pub fn nearest_existing(p: &Path) -> PathBuf {
     }
 }
 
-/// Canonical form when the path exists; lexical form otherwise.
 pub fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
@@ -135,7 +123,6 @@ pub fn human(n: u64) -> String {
     }
 }
 
-/// Phase timer, printed with -v or SHARETREE_TRACE=1.
 pub struct Trace {
     on: bool,
     start: Instant,
@@ -176,9 +163,6 @@ impl Trace {
     }
 }
 
-/// Number of worker threads for metadata-bound filesystem work. Cloning is
-/// serialized by the filesystem past a handful of threads
-/// (git-cow-worktree clone.go: min(NumCPU, 8)).
 pub fn workers(n_items: usize) -> usize {
     let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
     cpus.min(8).min(n_items.max(1))

@@ -75,9 +75,10 @@ SOFTWARE.
 lukeed/lane  (https://github.com/lukeed/lane, read at commit 3cebe2c)
 
 Adapted: the errno classification for "this filesystem cannot reflink"
-(src/reflink.rs, from crates/lane/src/cow.rs), the 4 KiB probe, absolute-symlink
-retargeting for cloned caches and the park-then-sweep removal (src/warm.rs,
-src/rm.rs, from cow.rs and worktree.rs).
+(src/reflink_unix.rs, from crates/lane/src/cow.rs), the 4 KiB probe
+(src/reflink.rs and src/reflink_unix.rs), absolute-symlink retargeting for cloned
+caches and the park-then-sweep removal (src/warm.rs, src/rm.rs, from cow.rs and
+worktree.rs).
 
 MIT License
 

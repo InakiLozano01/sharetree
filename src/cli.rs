@@ -1,10 +1,8 @@
-//! Command-line dispatch.
-
 use std::ffi::OsString;
 
-use crate::{add, advise, ls, reshare, rm, setup, space};
+use crate::{add, advise, reshare, rm, setup, space};
 
-pub const USAGE: &str = "\
+const USAGE: &str = "\
 sharetree: copy-on-write git worktrees
 
 usage:
@@ -14,7 +12,7 @@ usage:
   sharetree rm [-f [-f]] [--sync] <worktree>
   sharetree ls [--no-size]
   sharetree du [--all] [--raw] [<path>...]
-  sharetree reshare [<worktree>] [--from <worktree>] [--dry-run] [--min-size <bytes>] [-v]
+  sharetree reshare [<worktree> | --all] [--from <worktree>] [--dry-run] [--min-size <bytes>] [-v]
   sharetree doctor [<path>]
   sharetree mount [--unmount] (--all | <worktree>...)
   sharetree setup volume|devdrive|status|mount|teardown|auto ...   (`sharetree setup help`)
@@ -33,7 +31,7 @@ add      Create a worktree like `git worktree add`, reflinking every tracked fil
                        (neither flag and auto_volume unset: ask on a terminal)
          --overlay     Linux, opt-in: fuse-overlayfs worktree over a shared base
                        checkout (whole-file copy-up on write, slower reads)
-         --windows-clone  Windows, experimental and untested: ReFS / Dev Drive
+         --windows-clone  Windows, experimental: ReFS / Dev Drive
                        block cloning (or windows_clone = true in the config)
          -v            show the donor, the plan and per-phase timings
 rm       Remove a worktree: same safety checks as `git worktree remove`, then the
@@ -41,7 +39,8 @@ rm       Remove a worktree: same safety checks as `git worktree remove`, then th
 ls       List worktrees with the bytes only they hold (where measurable).
 du       Show apparent size (what `du` reports) next to exclusive bytes.
 reshare  Linux: re-share files git rewrote, using FIDEDUPERANGE against a donor.
-         The kernel compares bytes; inodes, mtimes and the index stay valid.
+         --all scans the repository's checkouts on this filesystem once.
+         The kernel verifies byte equality. The Git index is read-only.
 doctor   Filesystem, backend `add` would use, volume, and dependency-store advice
          (pnpm, npm, yarn, bun, uv, pip, cargo, go).
 mount    Remount overlay worktrees after a reboot (the login unit runs --all).
@@ -56,16 +55,6 @@ SHARETREE_CONFIG overrides the config path; SHARETREE_NO_PROMPT=1 never asks
 Also usable as `git sharetree <command>` when git-sharetree is on PATH.
 ";
 
-#[cfg(target_os = "linux")]
-fn mount(args: &[OsString]) -> anyhow::Result<i32> {
-    crate::overlay::run_mount(args)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn mount(_args: &[OsString]) -> anyhow::Result<i32> {
-    anyhow::bail!("`sharetree mount` remounts overlay worktrees, which exist on Linux only")
-}
-
 pub fn run() -> i32 {
     crate::util::init_umask();
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -77,12 +66,17 @@ pub fn run() -> i32 {
     let result = match sub {
         "add" => add::run(rest),
         "rm" | "remove" => rm::run(rest),
-        "ls" | "list" => ls::run(rest),
+        "ls" | "list" => space::run_ls(rest),
         "du" => space::run_du(rest),
         "reshare" => reshare::run(rest),
         "doctor" => advise::run_doctor(rest),
         "setup" => setup::run(rest),
-        "mount" => mount(rest),
+        #[cfg(target_os = "linux")]
+        "mount" => crate::overlay::run_mount(rest),
+        #[cfg(not(target_os = "linux"))]
+        "mount" => Err(anyhow::anyhow!(
+            "`sharetree mount` remounts overlay worktrees, which exist on Linux only"
+        )),
         "__sweep" => rm::sweep_cmd(rest),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");

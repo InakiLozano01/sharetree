@@ -1,11 +1,3 @@
-//! Dependency advisor (research note §6): on any filesystem the larger win
-//! is usually a shared package store or compiler cache, not the checkout.
-//! sharetree detects lockfiles in the worktree and says what each tool will do
-//! on this filesystem (clone, hardlink or copy) and what to change.
-//!
-//! Detection is pure (a list of tracked paths in, findings out) so it is
-//! unit-tested; the environment is gathered once into `EnvView`.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +7,7 @@ use crate::backend::Platform;
 use crate::git;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Eco {
+enum Eco {
     Pnpm,
     Npm,
     Yarn,
@@ -27,7 +19,7 @@ pub enum Eco {
 }
 
 impl Eco {
-    pub fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Eco::Pnpm => "pnpm",
             Eco::Npm => "npm",
@@ -42,10 +34,9 @@ impl Eco {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Detected {
-    pub eco: Eco,
-    /// Marker files that triggered it (worktree-relative, `/`-separated).
-    pub files: Vec<String>,
+struct Detected {
+    eco: Eco,
+    files: Vec<String>,
 }
 
 fn eco_of(name: &str) -> Option<Eco> {
@@ -63,20 +54,17 @@ fn eco_of(name: &str) -> Option<Eco> {
     })
 }
 
-/// Ecosystems used in a tree, from its (tracked) paths.
-pub fn detect<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Detected> {
+fn detect(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Detected> {
     let mut found: Vec<Detected> = Vec::new();
-    for p in paths {
-        let comps: Vec<&str> = p.split('/').collect();
-        if comps
-            .iter()
-            .any(|c| *c == "node_modules" || *c == ".git" || *c == "testdata" || *c == "fixtures")
-        {
-            continue;
-        }
-        let Some(eco) = comps.last().and_then(|n| eco_of(n)) else {
+    for path in paths {
+        let p = path.as_ref();
+        let mut components = p.rsplit('/');
+        let Some(eco) = components.next().and_then(eco_of) else {
             continue;
         };
+        if components.any(|c| matches!(c, "node_modules" | ".git" | "testdata" | "fixtures")) {
+            continue;
+        }
         match found.iter_mut().find(|d| d.eco == eco) {
             Some(d) => d.files.push(p.to_string()),
             None => found.push(Detected {
@@ -85,7 +73,6 @@ pub fn detect<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Detected> {
             }),
         }
     }
-    // pip markers next to a uv project are uv's business.
     if found.iter().any(|d| d.eco == Eco::Uv) {
         found.retain(|d| d.eco != Eco::Pip);
     }
@@ -97,48 +84,44 @@ pub fn detect<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Detected> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FsClass {
-    /// The reflink probe succeeded here.
+enum FsClass {
     Reflink,
-    /// It failed: tools fall back to hardlinks (same filesystem) or copies.
     NoReflink,
 }
 
-/// Environment facts the advice depends on. `*_same_fs`: whether the tool's
-/// store/cache is on the worktree's filesystem (hardlinks need that).
 #[derive(Clone, Debug, Default)]
-pub struct EnvView {
-    pub cargo_target_dir: Option<String>,
-    pub rustc_wrapper: Option<String>,
-    pub sccache_basedirs: Option<String>,
-    pub sccache_installed: bool,
-    pub uv_link_mode: Option<String>,
-    pub uv_cache: Option<PathBuf>,
-    pub uv_cache_same_fs: Option<bool>,
-    pub bun_cache: Option<PathBuf>,
-    pub bun_cache_same_fs: Option<bool>,
-    pub pnpm_store: Option<PathBuf>,
-    pub pnpm_store_same_fs: Option<bool>,
-    pub goflags: Option<String>,
-    /// The repo's `.cargo/config.toml` sets `target-dir` / `build-dir`.
-    pub cargo_config_shared_dir: bool,
-    /// Directory holding the worktrees (for SCCACHE_BASEDIRS).
-    pub worktrees_parent: Option<PathBuf>,
+struct EnvView {
+    cargo_target_dir: Option<String>,
+    rustc_wrapper: Option<String>,
+    sccache_basedirs: Option<String>,
+    sccache_installed: bool,
+    uv_link_mode: Option<String>,
+    uv_cache: Option<PathBuf>,
+    uv_cache_same_fs: Option<bool>,
+    bun_cache: Option<PathBuf>,
+    bun_cache_same_fs: Option<bool>,
+    pnpm_store: Option<PathBuf>,
+    pnpm_store_same_fs: Option<bool>,
+    goflags: Option<String>,
+    cargo_config_shared_dir: bool,
+    worktrees_parent: Option<PathBuf>,
 }
 
-pub struct Ctx {
-    pub fs: String,
-    pub class: FsClass,
-    pub platform: Platform,
-    pub env: EnvView,
+struct Filesystem {
+    name: &'static str,
+    class: FsClass,
+    platform: Platform,
+}
+
+struct DependencyContext {
+    fs: Filesystem,
+    env: EnvView,
 }
 
 #[derive(Clone, Debug)]
-pub struct Advice {
-    /// One line for the hint after `sharetree add`; None when nothing to do.
-    pub short: Option<String>,
-    /// Everything, for `sharetree doctor`.
-    pub details: Vec<String>,
+struct Advice {
+    short: Option<String>,
+    details: Vec<String>,
 }
 
 fn yes_no(b: Option<bool>) -> &'static str {
@@ -149,27 +132,26 @@ fn yes_no(b: Option<bool>) -> &'static str {
     }
 }
 
-/// The link mode package stores end up with here.
-pub fn link_mode_summary(c: &Ctx) -> String {
-    match (c.class, c.platform) {
+fn link_mode_summary(fs: &Filesystem) -> String {
+    match (fs.class, fs.platform) {
         (FsClass::Reflink, _) => format!(
             "{} can reflink: package stores can clone (copy-on-write), so editing an installed file never reaches the store",
-            c.fs
+            fs.name
         ),
         (FsClass::NoReflink, Platform::Windows) => format!(
             "{} cannot clone: package stores hardlink (store on the same volume) or copy",
-            c.fs
+            fs.name
         ),
         (FsClass::NoReflink, _) => format!(
             "{} has no reflinks: package stores hardlink (store on the same filesystem) or copy",
-            c.fs
+            fs.name
         ),
     }
 }
 
-pub fn advise(d: &Detected, c: &Ctx) -> Advice {
+fn advise(d: &Detected, c: &DependencyContext) -> Advice {
     let e = &c.env;
-    let reflink = c.class == FsClass::Reflink;
+    let reflink = c.fs.class == FsClass::Reflink;
     let mut details = Vec::new();
     let short;
     match d.eco {
@@ -226,7 +208,7 @@ pub fn advise(d: &Detected, c: &Ctx) -> Advice {
                     yes_no(e.bun_cache_same_fs)
                 ));
             }
-            short = Some(match (c.platform, e.bun_cache_same_fs) {
+            short = Some(match (c.fs.platform, e.bun_cache_same_fs) {
                 (Platform::MacOs, _) => "clones (clonefile) from its cache".to_string(),
                 (_, Some(false)) => "the cache is on another filesystem, so bun copies; set BUN_INSTALL_CACHE_DIR to this filesystem".to_string(),
                 _ => "hardlinks from ~/.bun/install/cache (default backend on Linux and Windows); don't edit node_modules in place".to_string(),
@@ -243,7 +225,7 @@ pub fn advise(d: &Detected, c: &Ctx) -> Advice {
             if let Some(m) = &e.uv_link_mode {
                 details.push(format!("UV_LINK_MODE={m}"));
             }
-            short = Some(match (reflink, c.platform, e.uv_cache_same_fs) {
+            short = Some(match (reflink, c.fs.platform, e.uv_cache_same_fs) {
                 (_, _, Some(false)) => "the cache is on another filesystem, so every .venv is a full copy; set UV_CACHE_DIR to a path on this filesystem".to_string(),
                 (true, Platform::Windows, _) => "hardlinks from its cache (Windows default); `UV_LINK_MODE=clone` clones on ReFS".to_string(),
                 (true, _, _) => "clones each .venv from its cache (link-mode clone, the default): copy-on-write".to_string(),
@@ -314,9 +296,6 @@ pub fn advise(d: &Detected, c: &Ctx) -> Advice {
     Advice { short, details }
 }
 
-// ---------------------------------------------------------------------------
-// Gathering facts
-
 fn env_s(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
@@ -327,9 +306,7 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Same filesystem as `wt`? Judged at the nearest existing ancestor, since a
-/// store that does not exist yet will be created there.
-pub fn same_fs(a: &Path, wt: &Path) -> Option<bool> {
+fn same_fs(a: &Path, wt: &Path) -> Option<bool> {
     let a = crate::util::nearest_existing(a);
     #[cfg(unix)]
     {
@@ -396,8 +373,12 @@ fn cargo_config_shares_dir(wt: &Path) -> bool {
     })
 }
 
-/// `exact`: ask pnpm itself for its store (slow: starts node), for doctor.
-pub fn gather_env(wt: &Path, detected: &[Detected], exact: bool) -> EnvView {
+fn dependency_context(
+    wt: &Path,
+    fs: Filesystem,
+    detected: &[Detected],
+    exact: bool,
+) -> DependencyContext {
     let has = |e: Eco| detected.iter().any(|d| d.eco == e);
     let mut v = EnvView {
         cargo_target_dir: env_s("CARGO_TARGET_DIR").or_else(|| env_s("CARGO_BUILD_TARGET_DIR")),
@@ -435,78 +416,59 @@ pub fn gather_env(wt: &Path, detected: &[Detected], exact: bool) -> EnvView {
         } else {
             None
         };
-        // Without asking pnpm: it keeps one store per disk (creating
-        // `<fs root>/.pnpm-store` when the default store is elsewhere), so
-        // hardlinking is the expected outcome; leave the store unknown.
         if let Some(p) = asked {
             v.pnpm_store_same_fs = same_fs(&p, wt);
             v.pnpm_store = Some(p);
         }
     }
-    v
+    DependencyContext { fs, env: v }
 }
 
-/// Tracked paths of a worktree.
-pub fn tracked_paths(wt: &Path) -> Vec<String> {
-    git::output(wt, &["ls-files", "-z"])
-        .map(|o| {
-            git::split_z(&o)
-                .into_iter()
-                .map(|p| String::from_utf8_lossy(&p).into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+fn detect_in_worktree(wt: &Path) -> Vec<Detected> {
+    let Ok(output) = git::output(wt, &["ls-files", "-z"]) else {
+        return Vec::new();
+    };
+    let paths = git::split_z(&output);
+    detect(paths.iter().map(|path| String::from_utf8_lossy(path)))
 }
 
-pub fn fs_name(p: &Path) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        crate::linux::fs_name(p).to_string()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = p;
-        if cfg!(windows) {
-            "this volume".into()
+impl Filesystem {
+    fn probe(p: &Path) -> Self {
+        #[cfg(target_os = "linux")]
+        let name = crate::linux::fs_name(p);
+        #[cfg(not(target_os = "linux"))]
+        let name = if cfg!(windows) {
+            "this volume"
         } else {
-            "this filesystem".into()
-        }
-    }
-}
-
-pub fn fs_class(p: &Path) -> FsClass {
-    #[cfg(unix)]
-    {
-        if crate::reflink::probe(p).is_ok() {
+            "this filesystem"
+        };
+        #[cfg(not(unix))]
+        let _ = p;
+        #[cfg(unix)]
+        let class = if crate::reflink::probe(p).is_ok() {
             FsClass::Reflink
         } else {
             FsClass::NoReflink
+        };
+        #[cfg(not(unix))]
+        let class = FsClass::NoReflink;
+        Self {
+            name,
+            class,
+            platform: Platform::current(),
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = p;
-        FsClass::NoReflink
     }
 }
 
-/// The short hint printed after `sharetree add`. Silent when no ecosystem
-/// needs a change.
-pub fn print_add_hint(wt: &Path) {
+pub(crate) fn print_add_hint(wt: &Path) {
     if std::env::var_os("SHARETREE_NO_ADVICE").is_some_and(|v| !v.is_empty() && v != "0") {
         return;
     }
-    let paths = tracked_paths(wt);
-    let detected = detect(paths.iter().map(String::as_str));
+    let detected = detect_in_worktree(wt);
     if detected.is_empty() {
         return;
     }
-    let ctx = Ctx {
-        fs: fs_name(wt),
-        class: fs_class(wt),
-        platform: Platform::current(),
-        env: gather_env(wt, &detected, false),
-    };
+    let ctx = dependency_context(wt, Filesystem::probe(wt), &detected, false);
     let lines: Vec<(Eco, String)> = detected
         .iter()
         .filter_map(|d| advise(d, &ctx).short.map(|s| (d.eco, s)))
@@ -514,15 +476,14 @@ pub fn print_add_hint(wt: &Path) {
     if lines.is_empty() {
         return;
     }
-    eprintln!("sharetree: dependencies: {}", link_mode_summary(&ctx));
+    eprintln!("sharetree: dependencies: {}", link_mode_summary(&ctx.fs));
     for (eco, l) in lines.iter().take(4) {
         eprintln!("sharetree:   {:<5} {l}", eco.name());
     }
     eprintln!("sharetree:   (details: `sharetree doctor`; silence: SHARETREE_NO_ADVICE=1)");
 }
 
-/// `sharetree doctor [<path>]`.
-pub fn run_doctor(args: &[OsString]) -> Result<i32> {
+pub(crate) fn run_doctor(args: &[OsString]) -> Result<i32> {
     let mut path: Option<PathBuf> = None;
     for a in args {
         match a.to_str() {
@@ -534,46 +495,44 @@ pub fn run_doctor(args: &[OsString]) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     let start = crate::util::absolutize(path.as_deref().unwrap_or(Path::new(".")), &cwd);
     let wt = git::toplevel(&start).unwrap_or_else(|_| start.clone());
-    let fs = fs_name(&wt);
-    let class = fs_class(&wt);
+    let fs = Filesystem::probe(&wt);
     println!("worktree    {}", wt.display());
     println!(
-        "filesystem  {fs}: {}",
-        match class {
+        "filesystem  {}: {}",
+        fs.name,
+        match fs.class {
             FsClass::Reflink => "reflinks work (sharetree add shares blocks)",
             FsClass::NoReflink => "no reflinks (sharetree add alone writes full checkouts)",
         }
     );
 
-    // Backend `sharetree add` would pick for a sibling of this worktree.
     if let Ok(common) = git::common_dir(&wt) {
         let cfg = crate::config::Config::load()?;
         let vol = cfg.volume_for(&common);
         let decision = crate::backend::decide(
             &crate::backend::Inputs {
-                probe_ok: class == FsClass::Reflink && cfg!(unix),
-                volume: vol.map(|v| v.name.clone()),
+                probe_ok: fs.class == FsClass::Reflink && cfg!(unix),
+                volume: vol,
                 auto_volume: cfg.auto_volume_for(&common),
                 ..Default::default()
             },
-            Platform::current(),
+            fs.platform,
         );
         let what = match &decision {
-            crate::backend::Decision::Reflink { .. } => {
-                "reflink beside the destination".to_string()
-            }
-            crate::backend::Decision::IntoVolume(v) => {
-                format!("place the worktree in volume '{v}' (auto_volume)")
+            crate::backend::Decision::Reflink => "reflink beside the destination".to_string(),
+            crate::backend::Decision::Volume(v) => {
+                format!("place the worktree in volume '{}' (auto_volume)", v.name)
             }
             crate::backend::Decision::Plain(h) => format!(
                 "plain `git worktree add`{}",
-                crate::backend::hint_text(h, &fs)
+                crate::backend::hint_text(h, fs.name)
                     .map(|t| format!("\n            {t}"))
                     .unwrap_or_default()
             ),
             crate::backend::Decision::Ask(v) => format!(
-                "ask whether to place the worktree in volume '{v}' (auto_volume is not set; \
-                 without a terminal: plain `git worktree add`)"
+                "ask whether to place the worktree in volume '{}' (auto_volume is not set; \
+                 without a terminal: plain `git worktree add`)",
+                v.name
             ),
             crate::backend::Decision::Fail(m) => m.clone(),
         };
@@ -590,20 +549,14 @@ pub fn run_doctor(args: &[OsString]) -> Result<i32> {
         }
     }
 
-    let paths = tracked_paths(&wt);
-    let detected = detect(paths.iter().map(String::as_str));
-    let ctx = Ctx {
-        fs,
-        class,
-        platform: Platform::current(),
-        env: gather_env(&wt, &detected, true),
-    };
+    let detected = detect_in_worktree(&wt);
     println!();
     if detected.is_empty() {
         println!("dependencies: no lockfiles found (pnpm, npm, yarn, bun, uv, pip, cargo, go)");
         return Ok(0);
     }
-    println!("dependencies: {}", link_mode_summary(&ctx));
+    let ctx = dependency_context(&wt, fs, &detected, true);
+    println!("dependencies: {}", link_mode_summary(&ctx.fs));
     for d in &detected {
         let a = advise(d, &ctx);
         let shown: Vec<&str> = d.files.iter().take(3).map(String::as_str).collect();
@@ -632,11 +585,13 @@ pub fn run_doctor(args: &[OsString]) -> Result<i32> {
 mod tests {
     use super::*;
 
-    fn ctx(class: FsClass, platform: Platform) -> Ctx {
-        Ctx {
-            fs: "ext4".into(),
-            class,
-            platform,
+    fn ctx(class: FsClass, platform: Platform) -> DependencyContext {
+        DependencyContext {
+            fs: Filesystem {
+                name: "ext4",
+                class,
+                platform,
+            },
             env: EnvView {
                 worktrees_parent: Some(PathBuf::from("/src")),
                 ..Default::default()
@@ -685,14 +640,16 @@ mod tests {
 
     #[test]
     fn link_mode_is_stated_per_filesystem() {
-        assert!(link_mode_summary(&ctx(FsClass::NoReflink, Platform::Linux))
-            .contains("ext4 has no reflinks: package stores hardlink"));
+        assert!(
+            link_mode_summary(&ctx(FsClass::NoReflink, Platform::Linux).fs)
+                .contains("ext4 has no reflinks: package stores hardlink")
+        );
         let mut c = ctx(FsClass::Reflink, Platform::Linux);
-        c.fs = "btrfs".into();
-        assert!(link_mode_summary(&c).contains("btrfs can reflink"));
+        c.fs.name = "btrfs";
+        assert!(link_mode_summary(&c.fs).contains("btrfs can reflink"));
         let mut c = ctx(FsClass::NoReflink, Platform::Windows);
-        c.fs = "NTFS".into();
-        assert!(link_mode_summary(&c).contains("NTFS cannot clone"));
+        c.fs.name = "NTFS";
+        assert!(link_mode_summary(&c.fs).contains("NTFS cannot clone"));
     }
 
     #[test]

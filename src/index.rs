@@ -1,40 +1,30 @@
-//! Minimal git index (version 2, no extensions) writer.
-//!
-//! Ported from josharian/git-cow-worktree `index.go` (MIT, see
-//! THIRD_PARTY_NOTICES). The index exists for exactly one reader: the
-//! `git checkout -f HEAD` that follows. Git decides whether to rewrite a
-//! working-tree file by comparing it against the cached stat data of its
-//! index entry, so without this index the checkout would rewrite every file
-//! we just cloned and undo the sharing. Entries we omit are not lost:
-//! checkout builds the real index from the target tree and writes anything
-//! missing here.
-
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use sha1::Digest;
 
 use crate::git::ObjectFormat;
+#[cfg(any(unix, windows))]
+use crate::{git, hash, reflink, util};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Stat {
-    pub ctime_s: u32,
-    pub ctime_ns: u32,
-    pub mtime_s: u32,
-    pub mtime_ns: u32,
-    pub dev: u32,
-    pub ino: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub size: u32,
+struct Stat {
+    ctime_s: u32,
+    ctime_ns: u32,
+    mtime_s: u32,
+    mtime_ns: u32,
+    dev: u32,
+    ino: u32,
+    uid: u32,
+    gid: u32,
+    size: u32,
 }
 
 #[cfg(unix)]
 impl Stat {
-    /// The fields git stores, truncated to 32 bits exactly as git does.
-    pub fn from_metadata(m: &std::fs::Metadata) -> Stat {
+    fn from_metadata(m: &std::fs::Metadata) -> Stat {
         use std::os::unix::fs::MetadataExt;
         Stat {
             ctime_s: m.ctime() as u32,
@@ -52,26 +42,139 @@ impl Stat {
 
 #[cfg(windows)]
 impl Stat {
-    /// What Git for Windows' `mingw_lstat` reports (see winclone.rs).
-    pub fn from_metadata(m: &std::fs::Metadata) -> Stat {
+    fn from_metadata(m: &std::fs::Metadata) -> Stat {
         use std::os::windows::fs::MetadataExt;
-        crate::winclone::git_stat(m.creation_time(), m.last_write_time(), m.file_size())
+        Stat::from_windows_times(m.creation_time(), m.last_write_time(), m.file_size())
+    }
+}
+
+#[cfg(any(windows, test))]
+const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
+
+#[cfg(any(windows, test))]
+fn filetime_to_unix(ft: u64) -> (i64, u32) {
+    let t = ft as i64 - EPOCH_DIFF_100NS;
+    (
+        t.div_euclid(10_000_000),
+        (t.rem_euclid(10_000_000) * 100) as u32,
+    )
+}
+
+#[cfg(any(windows, test))]
+impl Stat {
+    fn from_windows_times(creation: u64, last_write: u64, size: u64) -> Self {
+        let (cs, cns) = filetime_to_unix(creation);
+        let (ms, mns) = filetime_to_unix(last_write);
+        Self {
+            ctime_s: cs as u32,
+            ctime_ns: cns,
+            mtime_s: ms as u32,
+            mtime_ns: mns,
+            size: size as u32,
+            ..Self::default()
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct IndexEntry {
-    pub path: Vec<u8>,
-    pub mode: u32,
-    pub oid: Vec<u8>,
-    pub stat: Stat,
+struct IndexEntry {
+    path: Vec<u8>,
+    mode: u32,
+    oid: Vec<u8>,
+    stat: Stat,
+}
+
+#[cfg(any(unix, windows))]
+pub struct VerifiedClone {
+    entry: IndexEntry,
+    size: u64,
+}
+
+#[cfg(any(unix, windows))]
+pub fn verify_clone(
+    worktree: &Path,
+    path: &[u8],
+    target: &git::Entry,
+    fmt: ObjectFormat,
+) -> Option<VerifiedClone> {
+    let full = worktree.join(util::bytes_to_path(path));
+    let verify = || {
+        let want = hex_to_raw(&target.oid)?;
+        if !target.is_regular() || want.len() != fmt.raw_len() {
+            return None;
+        }
+        let mut file = reflink::open_no_follow(&full).ok()?;
+        let before = file.metadata().ok()?;
+        let stat = clone_stat(&before, target.size, target.mode)?;
+        if hash::blob_oid(&mut file, target.size, fmt).ok()?? != want {
+            return None;
+        }
+        let after = file.metadata().ok()?;
+        if clone_stat(&after, target.size, target.mode) != Some(stat) {
+            return None;
+        }
+        Some(VerifiedClone {
+            entry: IndexEntry {
+                path: path.to_vec(),
+                mode: target.mode,
+                oid: want,
+                stat,
+            },
+            size: target.size,
+        })
+    };
+    let verified = verify();
+    if verified.is_none() {
+        let _ = fs::remove_file(full);
+    }
+    verified
+}
+
+#[cfg(any(unix, windows))]
+fn clone_stat(metadata: &fs::Metadata, size: u64, mode: u32) -> Option<Stat> {
+    (reflink::is_plain_file(metadata)
+        && metadata.len() == size
+        && util::exec_bit_matches(metadata, mode == git::MODE_EXEC))
+    .then(|| Stat::from_metadata(metadata))
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+pub struct SeededIndex {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+#[cfg(any(unix, windows))]
+pub fn seed_worktree(
+    worktree: &Path,
+    verified: Vec<VerifiedClone>,
+    fmt: ObjectFormat,
+) -> Result<SeededIndex> {
+    let mut seeded = SeededIndex::default();
+    let mut entries = Vec::with_capacity(verified.len());
+    for VerifiedClone { entry, size } in verified {
+        let full = worktree.join(util::bytes_to_path(&entry.path));
+        let still = fs::symlink_metadata(&full)
+            .ok()
+            .and_then(|md| clone_stat(&md, size, entry.mode));
+        if still == Some(entry.stat) {
+            seeded.bytes += size;
+            entries.push(entry);
+        } else {
+            let _ = fs::remove_file(full);
+        }
+    }
+    seeded.entries = entries.len();
+    if !entries.is_empty() {
+        write(&git::git_path(worktree, "index")?, &mut entries, fmt)?;
+    }
+    Ok(seeded)
 }
 
 const NAME_MASK: usize = 0x0fff;
 
-/// Serialize `entries` (any order) as a v2 index with a trailing checksum.
-pub fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> {
-    // Git requires entries sorted by raw path bytes (stage 0 only here).
+fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     for w in entries.windows(2) {
         if w[0].path == w[1].path {
@@ -104,7 +207,6 @@ pub fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> 
         let flags = e.path.len().min(NAME_MASK) as u16;
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&e.path);
-        // At least one NUL, then pad the entry to a multiple of 8 bytes.
         buf.push(0);
         while (buf.len() - start) % 8 != 0 {
             buf.push(0);
@@ -123,15 +225,8 @@ pub fn encode(entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<Vec<u8>> 
     Ok(buf)
 }
 
-/// Write the index through `index.lock` + rename, as git does, so a
-/// concurrent git process fails loudly instead of racing us and a partial
-/// write can never become the index.
-pub fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<()> {
-    let mut data = encode(entries, fmt)?;
-    if std::env::var_os("SHARETREE_TEST_CORRUPT_INDEX").is_some() {
-        // Test hook: an entry count git will refuse, to exercise recovery.
-        data[8..12].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
-    }
+fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Result<()> {
+    let data = encode(entries, fmt)?;
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
     let lock = std::path::PathBuf::from(lock);
@@ -140,14 +235,18 @@ pub fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Resu
         .create_new(true)
         .open(&lock)
         .with_context(|| format!("create {}", lock.display()))?;
-    // No fsync, like git's own index writes: the next command reads it at
-    // once, and on Btrfs an fsync here waits for the transaction holding
-    // every clone we just made (1.4 s on a kernel tree).
-    let res = f.write_all(&data);
+    let res = (|| -> Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => bail!("{} already exists", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+        }
+        f.write_all(&data).context("write index.lock")
+    })();
     drop(f);
     if let Err(e) = res {
         let _ = std::fs::remove_file(&lock);
-        return Err(e).context("write index.lock");
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&lock, path) {
         let _ = std::fs::remove_file(&lock);
@@ -156,13 +255,14 @@ pub fn write(path: &Path, entries: &mut [IndexEntry], fmt: ObjectFormat) -> Resu
     Ok(())
 }
 
-pub fn hex_to_raw(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+fn hex_to_raw(hex: &str) -> Option<Vec<u8>> {
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+    pairs
+        .iter()
+        .map(|&[a, b]| Some(((a as char).to_digit(16)? * 16 + (b as char).to_digit(16)?) as u8))
         .collect()
 }
 
@@ -189,7 +289,6 @@ mod tests {
         let data = encode(&mut v, ObjectFormat::Sha1).unwrap();
         assert_eq!(&data[..4], b"DIRC");
         assert_eq!(u32::from_be_bytes(data[8..12].try_into().unwrap()), 2);
-        // 62-byte fixed part + 3-byte name + NUL padding to 72.
         assert_eq!(&data[12 + 62..12 + 65], b"a/c");
         assert_eq!((data.len() - 12 - 20) % 8, 0);
         let body = &data[..data.len() - 20];
@@ -214,5 +313,73 @@ mod tests {
     fn hex_round_trip() {
         assert_eq!(hex_to_raw("00ff10"), Some(vec![0, 255, 16]));
         assert_eq!(hex_to_raw("0"), None);
+        assert_eq!(hex_to_raw("00é1"), None);
+        assert_eq!(hex_to_raw("0€"), None);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn seeded_index_contains_only_verified_unchanged_clones() {
+        for fmt in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let object_format = match fmt {
+                ObjectFormat::Sha1 => "--object-format=sha1",
+                ObjectFormat::Sha256 => "--object-format=sha256",
+            };
+            git::output(root, &["init", object_format]).unwrap();
+            let good = b"hello\n";
+            let oid =
+                git::output_with_input(root, &["hash-object", "-w", "--stdin"], good).unwrap();
+            let oid = std::str::from_utf8(git::trim_nl(&oid)).unwrap().to_string();
+            let target = git::Entry {
+                oid: oid.clone(),
+                mode: git::MODE_REGULAR,
+                size: good.len() as u64,
+            };
+            fs::write(root.join("same"), good).unwrap();
+            fs::write(root.join("changed"), good).unwrap();
+            fs::write(root.join("wrong"), b"world\n").unwrap();
+
+            assert!(verify_clone(root, b"wrong", &target, fmt).is_none());
+            assert!(!root.join("wrong").exists());
+            let unchanged = verify_clone(root, b"same", &target, fmt).unwrap();
+            let changed = verify_clone(root, b"changed", &target, fmt).unwrap();
+            fs::write(root.join("changed"), b"different size\n").unwrap();
+
+            let seeded = seed_worktree(root, vec![unchanged, changed], fmt).unwrap();
+            assert_eq!(seeded.entries, 1);
+            assert_eq!(seeded.bytes, good.len() as u64);
+            assert!(!root.join("changed").exists());
+            assert_eq!(
+                git::ls_files_stage(root).unwrap(),
+                vec![(b"same".to_vec(), git::MODE_REGULAR, oid)]
+            );
+        }
+    }
+
+    #[test]
+    fn existing_git_index_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        fs::write(&path, b"existing index").unwrap();
+        assert!(write(&path, &mut [], ObjectFormat::Sha1).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"existing index");
+        assert!(!dir.path().join("index.lock").exists());
+    }
+
+    #[test]
+    fn filetimes_map_like_git_for_windows() {
+        let epoch = EPOCH_DIFF_100NS as u64;
+        assert_eq!(filetime_to_unix(epoch), (0, 0));
+        let ft = epoch + 1_767_225_600 * 10_000_000 + 1_234_567;
+        assert_eq!(filetime_to_unix(ft), (1_767_225_600, 123_456_700));
+        assert_eq!(filetime_to_unix(epoch - 1), (-1, 999_999_900));
+
+        let stat = Stat::from_windows_times(ft, ft + 10_000_000, (5 << 32) + 7);
+        assert_eq!((stat.ctime_s, stat.ctime_ns), (1_767_225_600, 123_456_700));
+        assert_eq!(stat.mtime_s, 1_767_225_601);
+        assert_eq!((stat.dev, stat.ino, stat.uid, stat.gid), (0, 0, 0, 0));
+        assert_eq!(stat.size, 7, "truncated to 32 bits like git");
     }
 }

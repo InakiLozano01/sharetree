@@ -1,11 +1,3 @@
-//! `sharetree setup volume` end to end: a real Btrfs loop image attached and
-//! mounted through udisks, worktrees placed in it from a repository on a
-//! filesystem without reflinks (tmpfs), then torn down.
-//!
-//! Runs only where udisks works without a password (an active desktop
-//! session); everywhere else it prints SKIP. It never uses sudo, and it
-//! always unmounts, detaches and deletes what it created, even on failure.
-
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -77,8 +69,6 @@ fn loops_for(image: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Always leaves the host clean: sharetree's own teardown first, then raw
-/// udisksctl for anything left attached.
 struct Cleanup {
     image: PathBuf,
     config: PathBuf,
@@ -143,7 +133,6 @@ fn setup_xfs_volume_then_add_into_it() {
     scenario("xfs");
 }
 
-/// `sharetree du --raw <path>`: (apparent, exclusive) bytes.
 fn du_raw(sb: &Sandbox, dir: &Path, cfg: &Path, path: &Path) -> (u64, Option<u64>) {
     let (out, _) = ok(sb, dir, cfg, &["du", "--raw", &path.to_string_lossy()]);
     let mut f = out.lines().next().unwrap_or_default().split('\t');
@@ -151,7 +140,6 @@ fn du_raw(sb: &Sandbox, dir: &Path, cfg: &Path, path: &Path) -> (u64, Option<u64
     (apparent, f.next().and_then(|x| x.parse().ok()))
 }
 
-/// Free bytes of the filesystem holding `p`, after a sync.
 fn free_bytes(p: &Path) -> u64 {
     let _ = Command::new("sync").arg("-f").arg(p).status();
     let out = Command::new("stat")
@@ -169,11 +157,10 @@ fn scenario(kind: &str) {
         eprintln!("SKIP setup_{kind}_volume_then_add_into_it: {why}");
         return;
     }
-    let state = Sandbox::home(); // config + image (Btrfs host: image made NOCOW)
+    let state = Sandbox::home();
     let Some(sb) = Sandbox::tmpfs() else { return };
     let cfg = state.p("config.toml");
     let image = state.p(&format!("volume-{kind}.img"));
-    // XFS labels hold at most 12 characters.
     let label = format!("st{}{}", &kind[..1], std::process::id() % 100_000_000);
     let mut guard = Cleanup {
         image: image.clone(),
@@ -195,7 +182,6 @@ fn scenario(kind: &str) {
         "--no-unit",
     ];
 
-    // --print changes nothing and shows the unit; systemd accepts the unit.
     let mut print_args = setup.to_vec();
     print_args.retain(|a| *a != "--no-unit");
     print_args.push("--print");
@@ -238,7 +224,6 @@ fn scenario(kind: &str) {
         );
     }
 
-    // Create, attach, mount. A second run is a no-op.
     let (out, _) = ok(&sb, sb.root(), &cfg, &setup);
     assert!(out.contains("is mounted at"), "{out}");
     ok(&sb, sb.root(), &cfg, &setup);
@@ -251,7 +236,6 @@ fn scenario(kind: &str) {
         "{st}"
     );
 
-    // A repository on tmpfs: no reflinks there.
     let main = sb.repo("main", &[]);
     guard.repo = Some(main.clone());
     sb.git(
@@ -277,7 +261,7 @@ fn scenario(kind: &str) {
     );
     assert!(sb.p("plain").is_dir() && !sb.p("plain").is_symlink());
 
-    // Into the volume: a seed, then a reflinked worktree behind a symlink.
+    let before_placement = std::fs::read(&cfg).unwrap();
     let cow = sb.p("cow");
     let (_, err) = ok(
         &sb,
@@ -299,8 +283,6 @@ fn scenario(kind: &str) {
     let list = sb.git(&main, &["worktree", "list", "--porcelain"]);
     assert!(list.contains("locked sharetree seed"), "{list}");
     assert!(list.contains("locked sharetree volume"), "{list}");
-    // Exclusive bytes: `btrfs filesystem du` on Btrfs, FIEMAP unshared
-    // extents on XFS; either way only the small files git wrote.
     let (apparent, excl) = du_raw(&sb, &main, &cfg, &real);
     let excl = excl.expect("exclusive bytes are measurable in the volume");
     assert!(apparent > 512 * 1024, "apparent {apparent}");
@@ -310,7 +292,25 @@ fn scenario(kind: &str) {
         assert_eq!(b, excl, "sharetree du uses btrfs filesystem du");
     }
 
-    // auto_volume for this repo; --no-volume overrides it.
+    let inside = real.with_file_name("inside");
+    let (_, err) = ok(
+        &sb,
+        &main,
+        &cfg,
+        &["add", "--detach", &inside.to_string_lossy()],
+    );
+    assert!(reflinked(&err) > 0, "{err}");
+    assert!(!err.contains("creating the volume's seed"), "{err}");
+    assert!(inside.is_dir() && !inside.is_symlink(), "{err}");
+    assert_equivalent(&sb, &sb.p("stock"), &inside);
+    assert_eq!(std::fs::read(&cfg).unwrap(), before_placement);
+    ok(
+        &sb,
+        &main,
+        &cfg,
+        &["rm", "--sync", &inside.to_string_lossy()],
+    );
+
     ok(&sb, &main, &cfg, &["setup", "auto", "on", "--repo"]);
     let free_before = free_bytes(&mp);
     let (_, err) = ok(
@@ -320,8 +320,6 @@ fn scenario(kind: &str) {
         &["add", "--detach", &sb.p("auto").to_string_lossy()],
     );
     assert!(sb.p("auto").is_symlink(), "{err}");
-    // Ground truth: the volume's free space barely moves for a worktree
-    // whose apparent size is over half a MiB (metadata and small files).
     let used = free_before.saturating_sub(free_bytes(&mp));
     eprintln!("{kind}: second worktree used {used} bytes of the volume ({apparent} apparent)");
     assert!(
@@ -332,7 +330,6 @@ fn scenario(kind: &str) {
         !err.contains("creating the volume's seed"),
         "the seed is reused: {err}"
     );
-    // A new commit: the clean seed is advanced to it before the next add.
     write(&main.join("src/mod3/data3.bin"), &bytes(333, 20_000));
     let head = sb.commit_all(&main, "change");
     let (_, err) = ok(
@@ -371,15 +368,12 @@ fn scenario(kind: &str) {
         "{err}"
     );
 
-    // The doctor reports the volume.
     let (doc, _) = ok(&sb, &main, &cfg, &["doctor"]);
     assert!(doc.contains("tmpfs") && doc.contains("mounted at"), "{doc}");
 
-    // rm through the symlink removes the worktree and the symlink.
     ok(&sb, &main, &cfg, &["rm", "--sync", &cow.to_string_lossy()]);
     assert!(cow.symlink_metadata().is_err() && !real.exists());
 
-    // Teardown refuses while a user worktree lives in the volume.
     let (good, _, err) = run(&sb, &main, &cfg, &["setup", "teardown", "--delete-image"]);
     assert!(!good && err.contains("--force"), "{err}");
     ok(

@@ -1,16 +1,3 @@
-//! `sharetree setup ...`: one-time creation of a copy-on-write volume for
-//! filesystems that cannot reflink (research note §7.3, §7.4).
-//!
-//! ```text
-//! sharetree setup volume   [--fs btrfs|xfs] [--size N] [--image P] [--name N]
-//!                          [--label L] [--auto] [--no-unit] [--print]
-//! sharetree setup devdrive [--size N] [--letter X] [--vhdx P] [--label L] [--print]
-//! sharetree setup status
-//! sharetree setup mount    [--volume N]
-//! sharetree setup teardown [--volume N] [--delete-image] [--force] [--print]
-//! sharetree setup auto     on|off|ask [--repo]
-//! ```
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -32,7 +19,6 @@ usage:
   sharetree setup auto     on|off|ask [--repo]
 ";
 
-/// Tiny option scanner: `--key value`, `--key=value` and flags.
 struct Opts {
     args: Vec<String>,
 }
@@ -79,6 +65,13 @@ impl Opts {
         }
         Ok(self.args)
     }
+
+    fn finish_empty(self) -> Result<()> {
+        if let Some(arg) = self.finish()?.first() {
+            bail!("setup: unexpected argument {arg}\n{USAGE}");
+        }
+        Ok(())
+    }
 }
 
 pub fn run(args: &[OsString]) -> Result<i32> {
@@ -120,7 +113,6 @@ fn pick_volume<'c>(cfg: &'c Config, name: Option<&str>) -> Result<&'c Volume> {
     }
 }
 
-/// `auto_volume` as shown to the user.
 pub fn auto_desc(v: Option<bool>) -> &'static str {
     match v {
         Some(true) => "true",
@@ -129,7 +121,6 @@ pub fn auto_desc(v: Option<bool>) -> &'static str {
     }
 }
 
-/// One line: where the volume is and whether it is mounted.
 pub fn volume_state_line(v: &Volume) -> String {
     match volume::current_state(v) {
         State::Mounted { mountpoint, device } => format!(
@@ -159,9 +150,6 @@ fn user_name() -> String {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// setup volume (Linux)
-
 fn setup_volume(args: &[OsString]) -> Result<i32> {
     let mut o = Opts::new(args)?;
     let print = o.flag("--print");
@@ -175,9 +163,13 @@ fn setup_volume(args: &[OsString]) -> Result<i32> {
         .transpose()?;
     let image = o.value("--image")?.map(PathBuf::from);
     let label = o.value("--label")?;
-    let rest = o.finish()?;
-    if !rest.is_empty() {
-        bail!("setup volume: unexpected argument {}", rest[0]);
+    o.finish_empty()?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+    {
+        bail!("--name must contain only letters, digits, hyphens, underscores or dots");
     }
     let kind = match fs.as_deref() {
         None | Some("btrfs") => VolumeKind::Btrfs,
@@ -225,9 +217,9 @@ struct VolumeArgs {
 
 #[cfg(target_os = "linux")]
 fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
-    let mut cfg = Config::load()?;
+    let _lock = (!a.print).then(config::lock_volume_setup).transpose()?;
+    let cfg = Config::load()?;
     if let Some(v) = cfg.volume(&a.name).cloned() {
-        // Idempotent: make sure it is mounted, report, done.
         if a.print {
             println!(
                 "volume '{}' already exists: {}",
@@ -237,13 +229,15 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
             return Ok(0);
         }
         let mp = volume::mount_any(&v, false)?;
-        if let Some(vm) = cfg.volume_mut(&a.name) {
-            vm.mountpoint = Some(mp.clone());
-        }
-        if a.auto {
-            cfg.auto_volume = Some(true);
-        }
-        cfg.save()?;
+        Config::update(|cfg| {
+            if let Some(vm) = cfg.volume_mut(&a.name) {
+                vm.mountpoint = Some(mp.clone());
+            }
+            if a.auto {
+                cfg.auto_volume = Some(true);
+            }
+            Ok(())
+        })?;
         println!("sharetree volume '{}' is ready at {}", v.name, mp.display());
         return Ok(0);
     }
@@ -257,7 +251,23 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
         })
     });
     let image = crate::util::absolutize(&image, &std::env::current_dir()?);
-    let adopt = image.symlink_metadata().is_ok();
+    let adopt = match image.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => bail!("{} is not a regular image file", image.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("checking {}", image.display())),
+    };
+    if let Some(existing) = cfg
+        .volumes
+        .iter()
+        .find(|v| crate::util::canon(&v.image) == crate::util::canon(&image))
+    {
+        bail!(
+            "{} is already configured as volume '{}'",
+            image.display(),
+            existing.name
+        );
+    }
     let kind = if adopt {
         volume::image_kind(&image).ok_or_else(|| {
             anyhow!(
@@ -300,7 +310,11 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
     }
     let mut label = a.label.clone().unwrap_or_else(|| "sharetree".into());
     if kind == VolumeKind::Xfs {
-        label.truncate(12);
+        let mut end = label.len().min(12);
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        label.truncate(end);
     }
     let udisks = volume::udisks_usable();
     let fstab_mp = PathBuf::from(format!(
@@ -421,11 +435,14 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
             image.display()
         );
     }
-    cfg.volumes.push(v.clone());
-    if a.auto {
-        cfg.auto_volume = Some(true);
-    }
-    let cfg_path = cfg.save()?;
+    Config::update(|cfg| {
+        cfg.volumes.push(v.clone());
+        if a.auto {
+            cfg.auto_volume = Some(true);
+        }
+        Ok(())
+    })?;
+    let cfg_path = config::config_path().unwrap_or_default();
 
     match udisks {
         Ok(()) => {
@@ -442,10 +459,12 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
                     ),
                 }
             }
-            if let Some(vm) = cfg.volume_mut(&v.name) {
-                *vm = v.clone();
-            }
-            cfg.save()?;
+            let auto_volume = Config::update(|cfg| {
+                if let Some(vm) = cfg.volume_mut(&v.name) {
+                    *vm = v.clone();
+                }
+                Ok(cfg.auto_volume)
+            })?;
             println!(
                 "sharetree volume '{}' is mounted at {}",
                 v.name,
@@ -454,7 +473,7 @@ fn linux_setup_volume(a: VolumeArgs) -> Result<i32> {
             println!("config: {}", cfg_path.display());
             println!(
                 "next: `sharetree add --into-volume <path>`{}",
-                match cfg.auto_volume {
+                match auto_volume {
                     Some(true) => " (or plain `sharetree add`: auto_volume is on)",
                     Some(false) => "",
                     None => {
@@ -504,6 +523,13 @@ fn install_unit(exe: &Path, v: &Volume) -> Result<String> {
 
 #[cfg(target_os = "linux")]
 fn remove_unit(unit: &str) {
+    if !unit.starts_with("sharetree-volume-")
+        || !unit.ends_with(".service")
+        || Path::new(unit).file_name().and_then(|name| name.to_str()) != Some(unit)
+    {
+        eprintln!("sharetree: warning: skipping unexpected login unit {unit:?}");
+        return;
+    }
     let _ = volume::systemctl_user(&["disable", unit]);
     if let Some(dir) = config::systemd_user_dir() {
         let _ = std::fs::remove_file(dir.join(unit));
@@ -511,21 +537,21 @@ fn remove_unit(unit: &str) {
     let _ = volume::systemctl_user(&["daemon-reload"]);
 }
 
-// ---------------------------------------------------------------------------
-// setup mount / status / auto
-
 fn mount(args: &[OsString]) -> Result<i32> {
     let mut o = Opts::new(args)?;
     let name = o.value("--volume")?;
-    o.finish()?;
-    let mut cfg = Config::load()?;
+    o.finish_empty()?;
+    let _lock = config::lock_volume_use()?;
+    let cfg = Config::load()?;
     let v = pick_volume(&cfg, name.as_deref())?.clone();
     let mp = volume::mount_any(&v, false)?;
     if v.mountpoint.as_deref() != Some(mp.as_path()) {
-        if let Some(vm) = cfg.volume_mut(&v.name) {
-            vm.mountpoint = Some(mp.clone());
-        }
-        cfg.save()?;
+        Config::update(|cfg| {
+            if let Some(vm) = cfg.volume_mut(&v.name) {
+                vm.mountpoint = Some(mp.clone());
+            }
+            Ok(())
+        })?;
     }
     println!("{}", mp.display());
     Ok(0)
@@ -536,45 +562,40 @@ fn auto(args: &[OsString]) -> Result<i32> {
     let repo = o.flag("--repo");
     let rest = o.finish()?;
     let on = match rest.as_slice() {
-        [s] if s == "on" => true,
-        [s] if s == "off" => false,
-        [s] if s == "ask" || s == "unset" => {
-            let mut cfg = Config::load()?;
-            if repo {
-                let common = git::common_dir(&std::env::current_dir()?)?;
-                cfg.repo_mut(&common).auto_volume = None;
-                cfg.repos
-                    .retain(|r| r.volume.is_some() || r.auto_volume.is_some());
-            } else {
-                cfg.auto_volume = None;
-            }
-            cfg.save()?;
-            println!("auto_volume unset: `sharetree add` asks again");
-            return Ok(0);
-        }
+        [s] if s == "on" => Some(true),
+        [s] if s == "off" => Some(false),
+        [s] if s == "ask" || s == "unset" => None,
         _ => bail!("usage: sharetree setup auto on|off|ask [--repo]"),
     };
-    let mut cfg = Config::load()?;
-    if repo {
-        let common = git::common_dir(&std::env::current_dir()?)?;
-        cfg.repo_mut(&common).auto_volume = Some(on);
-        println!(
+    let common = repo
+        .then(|| git::common_dir(&std::env::current_dir()?))
+        .transpose()?;
+    let missing_volume = Config::update(|cfg| {
+        if let Some(common) = &common {
+            cfg.repo_mut(common).auto_volume = on;
+            cfg.repos
+                .retain(|r| r.volume.is_some() || r.auto_volume.is_some());
+        } else {
+            cfg.auto_volume = on;
+        }
+        Ok(cfg.volumes.is_empty())
+    })?;
+    match (on, common) {
+        (None, _) => println!("auto_volume unset: `sharetree add` asks again"),
+        (Some(on), Some(common)) => println!(
             "auto_volume = {on} for {} (overrides the global setting)",
             common.display()
-        );
-    } else {
-        cfg.auto_volume = Some(on);
-        println!("auto_volume = {on}");
+        ),
+        (Some(on), None) => println!("auto_volume = {on}"),
     }
-    cfg.save()?;
-    if on && cfg.volumes.is_empty() {
+    if on == Some(true) && missing_volume {
         eprintln!("sharetree: note: no volume is configured yet (`sharetree setup volume`)");
     }
     Ok(0)
 }
 
 fn status(args: &[OsString]) -> Result<i32> {
-    Opts::new(args)?.finish()?;
+    Opts::new(args)?.finish_empty()?;
     let cfg = Config::load()?;
     println!(
         "config       {}",
@@ -666,34 +687,58 @@ fn status(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-// ---------------------------------------------------------------------------
-// teardown
-
-/// Worktrees inside a mounted volume: (path, git common dir, is_seed).
-fn worktrees_in(root: &Path) -> Vec<(PathBuf, PathBuf, bool)> {
+fn worktrees_in(root: &Path) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
     let mut v = Vec::new();
-    for repo in std::fs::read_dir(root).into_iter().flatten().flatten() {
-        for wt in std::fs::read_dir(repo.path())
-            .into_iter()
-            .flatten()
-            .flatten()
+    for repo in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let repo = repo?;
+        if !repo.file_type()?.is_dir() {
+            continue;
+        }
+        let repo_path = repo.path();
+        for wt in std::fs::read_dir(&repo_path)
+            .with_context(|| format!("reading {}", repo_path.display()))?
         {
-            let p = wt.path();
-            if !p.join(".git").is_file() {
+            let wt = wt?;
+            if !wt.file_type()?.is_dir() {
                 continue;
             }
-            let Ok(admin) = crate::rm::admin_dir(&p) else {
-                continue;
-            };
-            let Some(common) = admin.parent().and_then(Path::parent) else {
-                continue;
-            };
+            let p = wt.path();
+            let dot_git = p.join(".git");
+            match dot_git.symlink_metadata() {
+                Ok(info) if info.is_file() => {}
+                Ok(_) => bail!(
+                    "cannot verify worktree registration at {}",
+                    dot_git.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("checking {}", dot_git.display())),
+            }
+            let admin = crate::rm::admin_dir(&p)?;
+            let common = admin
+                .parent()
+                .filter(|dir| dir.file_name().is_some_and(|name| name == "worktrees"))
+                .and_then(Path::parent)
+                .with_context(|| format!("invalid worktree registration at {}", p.display()))?;
             let seed = p.file_name().is_some_and(|n| n == volume::SEED_DIR);
             v.push((p, common.to_path_buf(), seed));
         }
     }
     v.sort();
-    v
+    Ok(v)
+}
+
+fn forget_volume(name: &str) -> Result<()> {
+    Config::update(|cfg| {
+        cfg.volumes.retain(|v| v.name != name);
+        for r in &mut cfg.repos {
+            if r.volume.as_deref() == Some(name) {
+                r.volume = None;
+            }
+        }
+        cfg.repos
+            .retain(|r| r.volume.is_some() || r.auto_volume.is_some());
+        Ok(())
+    })
 }
 
 fn teardown(args: &[OsString]) -> Result<i32> {
@@ -702,12 +747,13 @@ fn teardown(args: &[OsString]) -> Result<i32> {
     let delete = o.flag("--delete-image");
     let force = o.flag("--force");
     let print = o.flag("--print");
-    o.finish()?;
-    let mut cfg = Config::load()?;
+    o.finish_empty()?;
+    let _lock = (!print).then(config::lock_volume_setup).transpose()?;
+    let cfg = Config::load()?;
     let v = pick_volume(&cfg, name.as_deref())?.clone();
 
     if v.kind == VolumeKind::Devdrive {
-        return teardown_devdrive(&mut cfg, &v, delete, print);
+        return teardown_devdrive(&v, delete, force, print);
     }
     if print {
         println!("# sharetree setup teardown --volume {} would:", v.name);
@@ -726,15 +772,34 @@ fn teardown(args: &[OsString]) -> Result<i32> {
         println!("# drop volume '{}' from the config", v.name);
         return Ok(0);
     }
+    if delete {
+        if let Some(var) = git::context_override() {
+            bail!("unset {var} before deleting a volume that may contain worktrees");
+        }
+    }
 
-    // Worktrees inside: seeds are sharetree's; other ones are the user's.
-    let mounted = match volume::current_state(&v) {
+    let mounted = match volume::try_current_state(&v)? {
         State::Mounted { mountpoint, .. } => Some(mountpoint),
-        _ if delete => volume::mount_any(&v, true).ok(),
+        State::ImageMissing => None,
+        _ if delete => match volume::mount_any(&v, true) {
+            Ok(mountpoint) => Some(mountpoint),
+            Err(_) if force => None,
+            Err(e) => return Err(e).context(
+                "cannot inspect the volume for worktrees; use --force to delete without mounting",
+            ),
+        },
         _ => None,
     };
     if let Some(mp) = &mounted {
-        let wts = worktrees_in(&volume::worktrees_root(&v, mp));
+        let root = volume::worktrees_root(&v, mp);
+        let wts = match worktrees_in(&root) {
+            Ok(wts) => wts,
+            Err(e) if delete => return Err(e).context("cannot inspect the volume for worktrees"),
+            Err(e) => {
+                eprintln!("sharetree: warning: cannot inspect the volume for registered worktrees ({e:#})");
+                Vec::new()
+            }
+        };
         let users: Vec<&PathBuf> = wts.iter().filter(|w| !w.2).map(|w| &w.0).collect();
         if delete && !users.is_empty() && !force {
             bail!(
@@ -748,7 +813,7 @@ fn teardown(args: &[OsString]) -> Result<i32> {
                 let st = std::process::Command::new("git")
                     .arg("--git-dir")
                     .arg(common)
-                    .args(["worktree", "remove", "--force", "--force"])
+                    .args(["worktree", "remove", "--force", "--force", "--"])
                     .arg(p)
                     .status()
                     .context("running git worktree remove")?;
@@ -762,8 +827,6 @@ fn teardown(args: &[OsString]) -> Result<i32> {
                 wts.len()
             );
         }
-    } else if delete && !force {
-        bail!("cannot mount the volume to check for worktrees inside it; pass --force to delete the image anyway");
     }
 
     #[cfg(target_os = "linux")]
@@ -780,15 +843,7 @@ fn teardown(args: &[OsString]) -> Result<i32> {
             Err(e) => return Err(e).with_context(|| format!("deleting {}", v.image.display())),
         }
     }
-    cfg.volumes.retain(|x| x.name != v.name);
-    for r in &mut cfg.repos {
-        if r.volume.as_deref() == Some(v.name.as_str()) {
-            r.volume = None;
-        }
-    }
-    cfg.repos
-        .retain(|r| r.volume.is_some() || r.auto_volume.is_some());
-    cfg.save()?;
+    forget_volume(&v.name)?;
     println!(
         "sharetree volume '{}' removed{}",
         v.name,
@@ -803,9 +858,6 @@ fn teardown(args: &[OsString]) -> Result<i32> {
     );
     Ok(0)
 }
-
-// ---------------------------------------------------------------------------
-// Windows Dev Drive
 
 fn devdrive_opts(vhdx: &str, size: u64, letter: char, label: &str) -> Result<devdrive::Opts> {
     let data = config::data_dir()
@@ -853,11 +905,10 @@ fn setup_devdrive(args: &[OsString]) -> Result<i32> {
             .map(|d| d.join("devdrive.vhdx").display().to_string())
             .unwrap_or_else(|| r"%LOCALAPPDATA%\sharetree\devdrive.vhdx".into()),
     };
-    o.finish()?;
-    let opts = devdrive_opts(&vhdx, size, letter, &label)?;
-    let script = devdrive::setup_script(&opts);
+    o.finish_empty()?;
+    let mut opts = devdrive_opts(&vhdx, size, letter, &label)?;
     if print {
-        print!("{script}");
+        print!("{}", devdrive::setup_script(&opts));
         return Ok(0);
     }
     if !cfg!(windows) {
@@ -865,13 +916,17 @@ fn setup_devdrive(args: &[OsString]) -> Result<i32> {
             "`sharetree setup devdrive` runs on Windows; `--print` shows the PowerShell it would run"
         );
     }
-    let mut cfg = Config::load()?;
+    let _lock = config::lock_volume_setup()?;
+    let cfg = Config::load()?;
     if cfg.volumes.iter().any(|v| v.kind == VolumeKind::Devdrive) {
         bail!("a Dev Drive is already configured (`sharetree setup status`)");
     }
-    run_elevated(&script, "setup-devdrive.ps1", &opts.result_file)
+    let confirmed = run_elevated(&mut opts, "setup-devdrive.ps1", devdrive::setup_script)
         .and_then(|r| devdrive::parse_result(&r))?;
-    cfg.volumes.push(Volume {
+    if confirmed != Some(letter) {
+        bail!("the Dev Drive script did not confirm drive {letter}:");
+    }
+    let volume = Volume {
         name: "devdrive".into(),
         kind: VolumeKind::Devdrive,
         image: PathBuf::from(&opts.vhdx),
@@ -880,14 +935,18 @@ fn setup_devdrive(args: &[OsString]) -> Result<i32> {
         mount: MountMethod::Devdrive,
         mountpoint: Some(PathBuf::from(format!("{letter}:\\"))),
         unit: Some(devdrive::TASK_NAME.into()),
-    });
-    let p = cfg.save()?;
+    };
+    Config::update(|cfg| {
+        cfg.volumes.push(volume);
+        Ok(())
+    })?;
+    let p = config::config_path().unwrap_or_default();
     println!("Dev Drive {letter}: is ready; config: {}", p.display());
-    println!("next: `sharetree add --into-volume <path>` (sharetree does not block-clone on Windows yet: worktrees there are full checkouts, with Dev Drive's faster I/O)");
+    println!("next: `sharetree add --into-volume <path>` (add `--windows-clone` to try experimental block cloning on Windows 11 24H2 or later)");
     Ok(0)
 }
 
-fn teardown_devdrive(cfg: &mut Config, v: &Volume, delete: bool, print: bool) -> Result<i32> {
+fn teardown_devdrive(v: &Volume, delete: bool, force: bool, print: bool) -> Result<i32> {
     let letter = v
         .mountpoint
         .as_ref()
@@ -901,18 +960,18 @@ fn teardown_devdrive(cfg: &mut Config, v: &Volume, delete: bool, print: bool) ->
         &v.label,
     )?;
     opts.size_bytes = v.size.max(devdrive::MIN_SIZE_BYTES);
-    let script = devdrive::teardown_script(&opts, delete);
     if print {
-        print!("{script}");
+        print!("{}", devdrive::teardown_script(&opts, delete, force));
         return Ok(0);
     }
     if !cfg!(windows) {
         bail!("a Dev Drive is removed on Windows; `--print` shows the script");
     }
-    let r = run_elevated(&script, "teardown-devdrive.ps1", &opts.result_file)?;
+    let r = run_elevated(&mut opts, "teardown-devdrive.ps1", |opts| {
+        devdrive::teardown_script(opts, delete, force)
+    })?;
     devdrive::parse_result(&r)?;
-    cfg.volumes.retain(|x| x.name != v.name);
-    cfg.save()?;
+    forget_volume(&v.name)?;
     println!(
         "Dev Drive removed{}",
         if delete { " and its VHDX deleted" } else { "" }
@@ -920,15 +979,21 @@ fn teardown_devdrive(cfg: &mut Config, v: &Volume, delete: bool, print: bool) ->
     Ok(0)
 }
 
-/// Write `script` next to the config data and run it elevated (one UAC
-/// prompt), returning what it wrote to its result file.
-fn run_elevated(script: &str, file: &str, result_file: &str) -> Result<String> {
+fn run_elevated(
+    opts: &mut devdrive::Opts,
+    file: &str,
+    script: impl FnOnce(&devdrive::Opts) -> String,
+) -> Result<String> {
     let dir = config::data_dir().context("LOCALAPPDATA is not set")?;
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(file);
-    // A UTF-8 BOM makes Windows PowerShell 5.1 read the file as UTF-8.
-    std::fs::write(&path, format!("\u{feff}{script}"))?;
-    let _ = std::fs::remove_file(result_file);
+    let run = tempfile::tempdir_in(dir)?;
+    let path = run.path().join(file);
+    let result = run.path().join("result.txt");
+    opts.result_file = result
+        .to_str()
+        .context("result path must be Unicode")?
+        .into();
+    std::fs::write(&path, format!("\u{feff}{}", script(opts)))?;
     eprintln!(
         "sharetree: running {} elevated (review it with --print)",
         path.display()
@@ -941,7 +1006,8 @@ fn run_elevated(script: &str, file: &str, result_file: &str) -> Result<String> {
     if !st.success() {
         bail!("powershell exited with {st} (UAC declined?)");
     }
-    Ok(std::fs::read_to_string(result_file).unwrap_or_default())
+    std::fs::read_to_string(&result)
+        .context("the elevated Dev Drive script did not write its result")
 }
 
 #[cfg(test)]
@@ -965,6 +1031,20 @@ mod tests {
         assert!(o.finish().is_err());
         let mut o = Opts::new(&os(&["--size"])).unwrap();
         assert!(o.value("--size").is_err());
+        assert!(Opts::new(&os(&["unexpected"]))
+            .unwrap()
+            .finish_empty()
+            .is_err());
+    }
+
+    #[test]
+    fn teardown_checks_malformed_worktree_registrations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("project/topic");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(worktrees_in(tmp.path()).unwrap().is_empty());
+        std::fs::write(wt.join(".git"), "invalid registration").unwrap();
+        assert!(worktrees_in(tmp.path()).is_err());
     }
 
     #[test]

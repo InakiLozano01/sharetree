@@ -108,26 +108,6 @@ fn ranks_donors_after_excluding_locally_modified_files() {
 }
 
 #[test]
-fn ranks_donors_by_bytes_above_the_clone_threshold() {
-    let Some(sb) = Sandbox::reflink() else { return };
-    let main = sb.repo("main", &[]);
-    write(&main.join("medium-a.bin"), &bytes(140, 180_000));
-    write(&main.join("medium-b.bin"), &bytes(150, 180_000));
-    sb.commit_all(&main, "add medium files");
-    let donor = sb.p("donor");
-    sb.git(&main, &["worktree", "add", "-q", "--detach", "../donor"]);
-    sb.git(&donor, &["rm", "-q", "medium-a.bin", "medium-b.bin"]);
-    sb.git(&donor, &["commit", "-qm", "remove medium files"]);
-    write(&main.join("big.bin"), &bytes(160, 300_000));
-
-    let err = sb.sharetree_ok(&main, &["add", "--min-size=200000", "--detach", "../cow"]);
-    assert_eq!(reflinked(&err), 1, "{err}");
-    assert!(err.contains(&format!("from {}", donor.display())), "{err}");
-    sb.git(&main, &["restore", "big.bin"]);
-    assert_equivalent(&sb, &main, &sb.p("cow"));
-}
-
-#[test]
 fn stat_clean_but_modified_donor() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);

@@ -192,9 +192,8 @@ donor scoring:
    reflink support, OpenZFS gates its block cloning behind a setting, and
    overlayfs depends on the filesystem underneath.
 3. **Register.** It runs `git worktree add --no-checkout <your args>` and
-   ranks donors by the bytes they can supply by blob ID above the clone size
-   threshold, using matching file count to break ties. The final ranking
-   excludes donor paths with local edits. A worktree with
+   ranks donors by how many target files they can supply by blob ID. The
+   final ranking excludes donor paths with local edits. A worktree with
    mostly modified files is likely still being populated and is skipped.
 4. **Plan.** A target file is cloned only when all of these hold:
    - it is a regular file of at least `--min-size` bytes;

@@ -133,6 +133,33 @@ fn setup_xfs_volume_then_add_into_it() {
     scenario("xfs");
 }
 
+#[test]
+fn teardown_force_keeps_an_image_that_cannot_be_inspected() {
+    let sb = Sandbox::home();
+    let cfg = sb.p("config.toml");
+    let image = sb.p("detached.img");
+    write(&image, b"disposable image contents");
+    let config = format!(
+        "[[volume]]\nname = 'test'\nimage = '{}'\nkind = 'btrfs'\nlabel = 'test'\nmount = 'fstab'\nmountpoint = '{}'\n",
+        image.display(),
+        sb.p("unmounted").display(),
+    );
+    write(&cfg, config.as_bytes());
+
+    let (success, _, err) = run(
+        &sb,
+        sb.root(),
+        &cfg,
+        &["setup", "teardown", "--delete-image", "--force"],
+    );
+    assert!(
+        !success && err.contains("cannot inspect the volume"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(image).unwrap(), b"disposable image contents");
+    assert_eq!(std::fs::read_to_string(cfg).unwrap(), config);
+}
+
 fn du_raw(sb: &Sandbox, dir: &Path, cfg: &Path, path: &Path) -> (u64, Option<u64>) {
     let (out, _) = ok(sb, dir, cfg, &["du", "--raw", &path.to_string_lossy()]);
     let mut f = out.lines().next().unwrap_or_default().split('\t');
@@ -373,6 +400,21 @@ fn scenario(kind: &str) {
 
     ok(&sb, &main, &cfg, &["rm", "--sync", &cow.to_string_lossy()]);
     assert!(cow.symlink_metadata().is_err() && !real.exists());
+
+    let config = std::fs::read_to_string(&cfg).unwrap();
+    let fstab_config = config.replace("mount = \"udisks\"", "mount = \"fstab\"");
+    assert_ne!(fstab_config, config);
+    write(&cfg, fstab_config.as_bytes());
+    let (good, _, err) = run(
+        &sb,
+        &main,
+        &cfg,
+        &["setup", "teardown", "--delete-image", "--force"],
+    );
+    assert!(!good && err.contains("/etc/fstab"), "{err}");
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), fstab_config);
+    assert!(image.exists() && seed.join(".git").is_file() && sb.p("auto/.git").is_file());
+    write(&cfg, config.as_bytes());
 
     let (good, _, err) = run(&sb, &main, &cfg, &["setup", "teardown", "--delete-image"]);
     assert!(!good && err.contains("--force"), "{err}");

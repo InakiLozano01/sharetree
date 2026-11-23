@@ -687,44 +687,138 @@ fn status(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-fn worktrees_in(root: &Path) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
-    let mut v = Vec::new();
-    for repo in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
-        let repo = repo?;
-        if !repo.file_type()?.is_dir() {
-            continue;
+#[derive(Debug)]
+struct VolumeWorktree {
+    path: PathBuf,
+    common: PathBuf,
+    seed: bool,
+}
+
+fn is_owned_submodule(path: &Path, admin: &Path, parent_admin: &Path) -> Result<bool> {
+    let modules = parent_admin.join("modules");
+    if admin == modules || !admin.starts_with(&modules) {
+        return Ok(false);
+    }
+    let superproject = git::output(path, &["rev-parse", "--show-superproject-working-tree"])?;
+    let superproject =
+        crate::util::bytes_to_path(superproject.strip_suffix(b"\n").unwrap_or(&superproject));
+    if !modules.symlink_metadata()?.is_dir()
+        || !superproject.is_absolute()
+        || crate::rm::admin_dir(&superproject)?.canonicalize()? != parent_admin
+        || git::common_dir(path)?.canonicalize()? != admin
+        || git::toplevel(path)?.canonicalize()? != path
+    {
+        bail!("cannot verify submodule ownership at {}", path.display());
+    }
+    Ok(true)
+}
+
+fn seed_is_clean(path: &Path) -> bool {
+    git::output(path, &["ls-files", "--stage", "-v", "-z"]).is_ok_and(|index| {
+        git::split_z(&index).into_iter().all(|entry| {
+            if !entry.starts_with(b"H ") {
+                return false;
+            }
+            if !entry.starts_with(b"H 160000 ") {
+                return true;
+            }
+            let Some(tab) = entry.iter().position(|&byte| byte == b'\t') else {
+                return false;
+            };
+            let gitlink = path.join(crate::util::bytes_to_path(&entry[tab + 1..]));
+            match gitlink.symlink_metadata() {
+                Ok(info) if info.is_dir() => {
+                    std::fs::read_dir(&gitlink).is_ok_and(|mut entries| entries.next().is_none())
+                }
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+                Ok(_) => false,
+            }
+        })
+    }) && git::output(
+        path,
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=normal",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+        ],
+    )
+    .is_ok_and(|status| status.is_empty())
+}
+
+fn worktrees_in(root: &Path) -> Result<Vec<VolumeWorktree>> {
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::rc::Rc;
+
+    let root = root.canonicalize()?;
+    let mut worktrees = Vec::new();
+    let seed_lock = Path::new(volume::SEED_DIR).with_extension("lock");
+    let mut dirs = vec![(root.clone(), None::<Rc<PathBuf>>)];
+    while let Some((path, mut owner_admin)) = dirs.pop() {
+        let dot_git = path.join(".git");
+        match dot_git.symlink_metadata() {
+            Ok(info) if info.is_file() && path != root => {
+                let mut admin = crate::rm::admin_dir(&path)?.canonicalize()?;
+                let submodule = owner_admin
+                    .as_ref()
+                    .map(|parent| is_owned_submodule(&path, &admin, parent))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !submodule {
+                    let common = git::common_dir(&path)?;
+                    admin = crate::rm::checkout_admin(&common, &path)?.canonicalize()?;
+                    let wts = git::list_worktrees(&path)?;
+                    let mut matches = wts.iter().filter(|w| crate::util::canon(&w.path) == path);
+                    let wt = matches
+                        .next()
+                        .filter(|w| !w.is_main && matches.next().is_none())
+                        .with_context(|| {
+                            format!("cannot verify worktree registration at {}", path.display())
+                        })?;
+                    let seed = path.file_name().is_some_and(|n| n == volume::SEED_DIR)
+                        && wt.detached
+                        && volume::is_seed_lock(wt.lock_reason.as_deref())
+                        && matches!(admin.join("modules").symlink_metadata(), Err(e) if e.kind() == ErrorKind::NotFound)
+                        && seed_is_clean(&path);
+                    worktrees.push(VolumeWorktree {
+                        path: path.clone(),
+                        common,
+                        seed,
+                    });
+                }
+                owner_admin = Some(Rc::new(admin));
+            }
+            Ok(_) => bail!(
+                "cannot verify worktree registration at {}",
+                dot_git.display()
+            ),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", dot_git.display())),
         }
-        let repo_path = repo.path();
-        for wt in std::fs::read_dir(&repo_path)
-            .with_context(|| format!("reading {}", repo_path.display()))?
-        {
-            let wt = wt?;
-            if !wt.file_type()?.is_dir() {
-                continue;
+        for entry in fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                dirs.push((entry.path(), owner_admin.clone()));
+            } else if owner_admin.is_none()
+                && !(kind.is_file()
+                    && entry.file_name() == seed_lock.as_os_str()
+                    && entry.metadata()?.len() == 0)
+            {
+                bail!(
+                    "cannot account for {} in the volume",
+                    entry.path().display()
+                );
             }
-            let p = wt.path();
-            let dot_git = p.join(".git");
-            match dot_git.symlink_metadata() {
-                Ok(info) if info.is_file() => {}
-                Ok(_) => bail!(
-                    "cannot verify worktree registration at {}",
-                    dot_git.display()
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).with_context(|| format!("checking {}", dot_git.display())),
-            }
-            let admin = crate::rm::admin_dir(&p)?;
-            let common = admin
-                .parent()
-                .filter(|dir| dir.file_name().is_some_and(|name| name == "worktrees"))
-                .and_then(Path::parent)
-                .with_context(|| format!("invalid worktree registration at {}", p.display()))?;
-            let seed = p.file_name().is_some_and(|n| n == volume::SEED_DIR);
-            v.push((p, common.to_path_buf(), seed));
         }
     }
-    v.sort();
-    Ok(v)
+    worktrees.sort_by(|a, b| b.path.cmp(&a.path));
+    Ok(worktrees)
 }
 
 fn forget_volume(name: &str) -> Result<()> {
@@ -779,19 +873,56 @@ fn teardown(args: &[OsString]) -> Result<i32> {
     }
 
     let mounted = match volume::try_current_state(&v)? {
+        State::Mounted { ref mountpoint, .. } if v.mount == MountMethod::Fstab => {
+            bail!(
+                "volume '{}' is managed through /etc/fstab; teardown cannot unmount {}",
+                v.name,
+                mountpoint.display()
+            );
+        }
         State::Mounted { mountpoint, .. } => Some(mountpoint),
         State::ImageMissing => None,
-        _ if delete => match volume::mount_any(&v, true) {
-            Ok(mountpoint) => Some(mountpoint),
-            Err(_) if force => None,
-            Err(e) => return Err(e).context(
-                "cannot inspect the volume for worktrees; use --force to delete without mounting",
-            ),
-        },
+        _ if delete && v.mount == MountMethod::Fstab => bail!(
+            "cannot inspect the volume for worktrees: '{}' is managed through /etc/fstab",
+            v.name
+        ),
+        _ if delete => {
+            Some(volume::mount_any(&v, true).context("cannot inspect the volume for worktrees")?)
+        }
         _ => None,
     };
     if let Some(mp) = &mounted {
         let root = volume::worktrees_root(&v, mp);
+        #[cfg(target_os = "linux")]
+        if delete {
+            let root = root.canonicalize()?;
+            let State::Mounted {
+                mountpoint,
+                device: Some(device),
+            } = volume::try_current_state(&v)?
+            else {
+                bail!("cannot confirm the device mounted at {}", root.display());
+            };
+            let mounts = volume::mounts()?;
+            let mut at_root = mounts.iter().filter(|m| m.mountpoint == root);
+            if mountpoint != root
+                || !at_root
+                    .next()
+                    .is_some_and(|m| m.source == device && m.root == "/")
+                || at_root.next().is_some()
+            {
+                bail!("cannot inspect the entire volume at {}", root.display());
+            }
+            if let Some(mount) = mounts
+                .iter()
+                .find(|m| m.mountpoint != root && m.mountpoint.starts_with(&root))
+            {
+                bail!(
+                    "cannot inspect the volume while {} is mounted inside it",
+                    mount.mountpoint.display()
+                );
+            }
+        }
         let wts = match worktrees_in(&root) {
             Ok(wts) => wts,
             Err(e) if delete => return Err(e).context("cannot inspect the volume for worktrees"),
@@ -800,7 +931,7 @@ fn teardown(args: &[OsString]) -> Result<i32> {
                 Vec::new()
             }
         };
-        let users: Vec<&PathBuf> = wts.iter().filter(|w| !w.2).map(|w| &w.0).collect();
+        let users: Vec<&PathBuf> = wts.iter().filter(|w| !w.seed).map(|w| &w.path).collect();
         if delete && !users.is_empty() && !force {
             bail!(
                 "the volume holds {} worktree(s); remove them with `sharetree rm`, or pass --force to delete them with the image:\n  {}",
@@ -809,16 +940,20 @@ fn teardown(args: &[OsString]) -> Result<i32> {
             );
         }
         if delete {
-            for (p, common, _) in &wts {
+            for wt in &wts {
+                crate::rm::checkout_admin(&wt.common, &wt.path)?;
+                if wt.seed && !force && !seed_is_clean(&wt.path) {
+                    bail!("{} changed while inspecting the volume", wt.path.display());
+                }
                 let st = std::process::Command::new("git")
                     .arg("--git-dir")
-                    .arg(common)
+                    .arg(&wt.common)
                     .args(["worktree", "remove", "--force", "--force", "--"])
-                    .arg(p)
+                    .arg(&wt.path)
                     .status()
                     .context("running git worktree remove")?;
                 if !st.success() {
-                    bail!("git worktree remove failed for {}", p.display());
+                    bail!("git worktree remove failed for {}", wt.path.display());
                 }
             }
         } else if !wts.is_empty() {
@@ -1045,6 +1180,177 @@ mod tests {
         assert!(worktrees_in(tmp.path()).unwrap().is_empty());
         std::fs::write(wt.join(".git"), "invalid registration").unwrap();
         assert!(worktrees_in(tmp.path()).is_err());
+    }
+
+    fn fixture_repo(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        git::output(path, &["init", "-q"]).unwrap();
+        std::fs::write(path.join("tracked"), b"fixture").unwrap();
+        git::output(path, &["add", "tracked"]).unwrap();
+        git::output(
+            path,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )
+        .unwrap();
+    }
+
+    fn fixture_worktree(repo: &Path, checkout: &Path, reason: &str) {
+        git::output(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--lock",
+                "--reason",
+                reason,
+                checkout.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn teardown_inventories_root_deep_and_nested_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let root = tmp.path().join("volume");
+        std::fs::create_dir(&root).unwrap();
+        fixture_repo(&repo);
+
+        let seed = root.join("repo/.sharetree-seed");
+        let direct = root.join("direct");
+        let nested = direct.join("area/nested");
+        let named_seed = root.join("custom/deep/.sharetree-seed");
+        fixture_worktree(&repo, &seed, volume::SEED_LOCK_REASON);
+        fixture_worktree(&repo, &direct, "custom");
+        fixture_worktree(&repo, &nested, "custom");
+        fixture_worktree(&repo, &named_seed, "custom");
+        std::fs::write(seed.with_extension("lock"), []).unwrap();
+
+        let wts = worktrees_in(&root).unwrap();
+        assert_eq!(wts.len(), 4);
+        assert_eq!(wts.iter().filter(|wt| wt.seed).count(), 1);
+        assert!(wts
+            .iter()
+            .any(|wt| wt.path.ends_with("repo/.sharetree-seed") && wt.seed));
+        let index = |path: &Path| wts.iter().position(|wt| wt.path.ends_with(path)).unwrap();
+        assert!(index(Path::new("area/nested")) < index(Path::new("direct")));
+        assert!(wts
+            .iter()
+            .any(|wt| wt.path.ends_with("custom/deep/.sharetree-seed") && !wt.seed));
+
+        git::output(&seed, &["update-index", "--assume-unchanged", "tracked"]).unwrap();
+        std::fs::write(seed.join("tracked"), b"hidden edits").unwrap();
+        assert!(git::output(&seed, &["status", "--porcelain"])
+            .unwrap()
+            .is_empty());
+        assert!(worktrees_in(&root).unwrap().iter().all(|wt| !wt.seed));
+        git::output(&seed, &["update-index", "--no-assume-unchanged", "tracked"]).unwrap();
+        git::output(&seed, &["checkout", "--", "tracked"]).unwrap();
+
+        std::fs::write(seed.join("local-only"), b"keep").unwrap();
+        assert!(worktrees_in(&root).unwrap().iter().all(|wt| !wt.seed));
+    }
+
+    #[test]
+    fn teardown_accounts_for_owned_submodules_and_rejects_their_linked_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let source = tmp.path().join("source");
+        let root = tmp.path().join("volume");
+        std::fs::create_dir(&root).unwrap();
+        fixture_repo(&repo);
+        fixture_repo(&source);
+        git::output(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "path/to/module",
+            ],
+        )
+        .unwrap();
+        git::output(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=",
+                "commit",
+                "-qm",
+                "track submodule",
+            ],
+        )
+        .unwrap();
+        let checkout = root.join(volume::SEED_DIR);
+        fixture_worktree(&repo, &checkout, volume::SEED_LOCK_REASON);
+        assert!(worktrees_in(&root).unwrap()[0].seed);
+        let local = checkout.join("path/to/module/local-only");
+        std::fs::write(&local, b"keep").unwrap();
+        assert!(!worktrees_in(&root).unwrap()[0].seed);
+        std::fs::remove_file(local).unwrap();
+        git::output(
+            &checkout,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ],
+        )
+        .unwrap();
+
+        let worktrees = worktrees_in(&root).unwrap();
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].path, checkout.canonicalize().unwrap());
+        assert!(!worktrees[0].seed);
+
+        let module = checkout.join("path/to/module");
+        let external = tmp.path().join("external-module-worktree");
+        fixture_worktree(&module, &external, "external module worktree");
+        let err = worktrees_in(&root).unwrap_err();
+        assert!(err.to_string().contains("has its own Git worktrees"));
+        git::output(
+            &checkout,
+            &["submodule", "deinit", "-f", "--", "path/to/module"],
+        )
+        .unwrap();
+        assert!(!module.join(".git").exists());
+        let err = worktrees_in(&root).unwrap_err();
+        assert!(err.to_string().contains("has its own Git worktrees"));
+        assert!(external.join("tracked").is_file());
+    }
+
+    #[test]
+    fn teardown_refuses_to_inventory_unowned_volume_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("unknown");
+        std::fs::write(&p, "keep").unwrap();
+        let err = worktrees_in(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("cannot account for"));
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "keep");
     }
 
     #[test]

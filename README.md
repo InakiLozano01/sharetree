@@ -383,6 +383,9 @@ lock.
   remove the unit, and drop the volume from the config.
   - With `--delete-image` it removes the seeds and deletes the image. It
     refuses while your own worktrees live in the volume, unless `--force`.
+  - For an existing image managed through `/etc/fstab`, teardown leaves
+    mount configuration and image removal to the system administrator.
+    Inspect the image for registered worktrees before removing it.
   - Without it, the image and any worktrees in it are kept and stay
     registered; `setup volume --image <it>` adopts the image again.
   - Symlinks that `add` left outside the volume are not tracked, so a

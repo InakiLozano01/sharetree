@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -43,57 +43,184 @@ pub(crate) fn admin_dir(wt: &Path) -> Result<PathBuf> {
 }
 
 fn read_admin_dir(wt: &Path, original: &Path) -> Result<PathBuf> {
-    let bytes = fs::read(wt.join(".git"))
-        .with_context(|| format!("{} is not a linked worktree", wt.display()))?;
-    let path = git_path(&bytes)
+    let dot_git = wt.join(".git");
+    let bytes =
+        read_git_file(&dot_git).with_context(|| format!("reading {}", dot_git.display()))?;
+    let path = git::trim_nl(&bytes)
         .strip_prefix(b"gitdir: ")
         .ok_or_else(|| anyhow!("{}/.git is not a gitdir file", wt.display()))?;
-    Ok(util::absolutize(&util::bytes_to_path(path), original))
+    let path = decode_git_path(path, &dot_git)?;
+    if wt != original {
+        let mut parts = path.components();
+        if parts.find(|part| *part != Component::CurDir) == Some(Component::ParentDir) {
+            return Ok(original
+                .parent()
+                .context("missing original worktree parent")?
+                .join(parts.as_path()));
+        }
+    }
+    Ok(original.join(path))
 }
 
-fn git_path(bytes: &[u8]) -> &[u8] {
-    let path = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    if cfg!(windows) {
-        path.strip_suffix(b"\r").unwrap_or(path)
-    } else {
-        path
+fn read_git_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    if !path.symlink_metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("expected a regular Git metadata file at {}", path.display()),
+        ));
     }
+    fs::read(path)
+}
+
+fn decode_git_path(bytes: &[u8], source: &Path) -> Result<PathBuf> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        bail!("invalid Git path in {}", source.display());
+    }
+    #[cfg(windows)]
+    std::str::from_utf8(bytes)
+        .with_context(|| format!("invalid Git path in {}", source.display()))?;
+    Ok(util::bytes_to_path(bytes))
 }
 
 pub(crate) fn registered_admin(common: &Path, path: &Path) -> Result<Option<PathBuf>> {
     let root = common.join("worktrees");
-    let dirs = match fs::read_dir(&root) {
-        Ok(dirs) => dirs,
+    match root.symlink_metadata() {
+        Ok(info) if info.is_dir() => {}
+        Ok(_) => bail!("unexpected Git worktree directory {}", root.display()),
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", root.display())),
     };
-    let dotgit = path.join(".git");
-    for ent in dirs {
+    let path = checkout_path(path)?;
+    let mut registered = None;
+    for ent in fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
         let ent = ent?;
-        if !ent.file_type()?.is_dir() {
+        let kind = ent.file_type()?;
+        let admin = ent.path();
+        if kind.is_symlink() {
+            bail!("unexpected Git worktree directory {}", admin.display());
+        }
+        if !kind.is_dir() {
             continue;
         }
-        let admin = ent.path();
-        let link = match fs::read(admin.join("gitdir")) {
+        let gitdir = admin.join("gitdir");
+        let link = match read_git_file(&gitdir) {
             Ok(link) => link,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("reading {}/gitdir", admin.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("checking {}/gitdir", admin.display()))
+            }
         };
-        let target = util::absolutize(&util::bytes_to_path(git_path(&link)), &admin);
-        if util::canon(&target) == util::canon(&dotgit) {
-            return Ok(Some(admin));
+        let target = admin.join(decode_git_path(git::trim_nl(&link), &gitdir)?);
+        if target.file_name().is_some_and(|name| name == ".git")
+            && checkout_path(target.parent().context("missing checkout path")?)? == path
+        {
+            validate_admin(common, &admin)?;
+            if registered.replace(admin).is_some() {
+                bail!(
+                    "more than one Git registration belongs to {}",
+                    path.display()
+                );
+            }
         }
     }
-    Ok(None)
+    Ok(registered)
+}
+
+fn checkout_path(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(e).with_context(|| format!("resolving {}", path.display()));
+            };
+            match fs::read_link(path) {
+                Ok(target) => checkout_path(&parent.join(target)),
+                Err(err)
+                    if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+                {
+                    Ok(checkout_path(parent)?.join(name))
+                }
+                Err(err) => Err(err).with_context(|| format!("resolving {}", path.display())),
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("resolving {}", path.display())),
+    }
 }
 
 fn validate_admin(common: &Path, admin: &Path) -> Result<()> {
-    if admin.parent().map(util::canon) != Some(util::canon(&common.join("worktrees")))
+    let root = common.join("worktrees");
+    if !root.symlink_metadata()?.is_dir()
+        || !admin.symlink_metadata()?.is_dir()
         || admin
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
+            .parent()
+            .context("missing Git admin parent")?
+            .canonicalize()?
+            != root.canonicalize()?
     {
         bail!("unexpected Git worktree directory {}", admin.display());
+    }
+    let commondir = admin.join("commondir");
+    let link =
+        read_git_file(&commondir).with_context(|| format!("reading {}", commondir.display()))?;
+    let target = admin.join(decode_git_path(git::trim_nl(&link), &commondir)?);
+    if target.canonicalize()? != common.canonicalize()? {
+        bail!("{} belongs to a different Git repository", admin.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn checkout_admin(common: &Path, path: &Path) -> Result<PathBuf> {
+    if !path.symlink_metadata()?.is_dir() {
+        bail!("expected a worktree directory at {}", path.display());
+    }
+    let admin = admin_dir(path)?;
+    validate_admin(common, &admin)?;
+    if let Some(registered) = registered_admin(common, path)? {
+        if admin.canonicalize()? == registered.canonicalize()? {
+            reject_mounts(&registered)?;
+            reject_submodule_worktrees(&registered)?;
+            return Ok(registered);
+        }
+    }
+    bail!("Git registration does not point back to {}", path.display())
+}
+
+fn reject_submodule_worktrees(admin: &Path) -> Result<()> {
+    let mut dirs = vec![admin.join("modules")];
+    while let Some(dir) = dirs.pop() {
+        match dir.symlink_metadata() {
+            Ok(info) if info.is_dir() => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Ok(_) => bail!("cannot verify Git submodule metadata at {}", dir.display()),
+            Err(e) => return Err(e).with_context(|| format!("checking {}", dir.display())),
+        }
+        if dir
+            .join("HEAD")
+            .symlink_metadata()
+            .is_ok_and(|info| info.is_file())
+        {
+            let worktrees = dir.join("worktrees");
+            match worktrees.symlink_metadata() {
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Ok(info) if info.is_dir() && fs::read_dir(&worktrees)?.next().is_none() => {}
+                Ok(_) => bail!("submodule at {} has its own Git worktrees", dir.display()),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("checking {}", worktrees.display()))
+                }
+            }
+            dirs.push(dir.join("modules"));
+        } else {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    bail!(
+                        "cannot verify Git submodule metadata at {}",
+                        entry.path().display()
+                    );
+                }
+                dirs.push(entry.path());
+            }
+        }
     }
     Ok(())
 }
@@ -124,18 +251,31 @@ pub(crate) fn check_clean(path: &Path, admin: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_link(link: Option<&Path>) -> Result<()> {
+struct Alias {
+    path: PathBuf,
+    target: PathBuf,
+}
+
+fn remove_link(link: Option<&Alias>) -> Result<()> {
     if let Some(link) = link {
-        match fs::remove_file(link) {
+        match fs::read_link(&link.path) {
+            Ok(target) if target == link.target => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            _ => bail!(
+                "worktree alias {} changed during removal",
+                link.path.display()
+            ),
+        }
+        match fs::remove_file(&link.path) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("removing {}", link.display())),
+            Err(e) => return Err(e).with_context(|| format!("removing {}", link.path.display())),
         }
     }
     Ok(())
 }
 
-fn remove_with_git(cwd: &Path, path: &Path, force: u8, link: Option<&Path>) -> Result<i32> {
+fn remove_with_git(cwd: &Path, path: &Path, force: u8, link: Option<&Alias>) -> Result<i32> {
     let mut args: Vec<OsString> = vec!["worktree".into(), "remove".into()];
     args.extend((0..force).map(|_| OsString::from("--force")));
     args.extend(["--".into(), path.as_os_str().to_owned()]);
@@ -168,17 +308,26 @@ impl ParkedWorktree {
         fs::create_dir_all(&trash)?;
         fs::create_dir_all(&admin_trash)?;
         let checkout = trash.join(&id);
-        let parked = Self {
+        let mut parked = Self {
             checkout,
             admin: admin_trash.join(format!("{id}-admin")),
         };
-        fs::rename(path, &parked.checkout)?;
+        if let Err(error) = fs::rename(path, &parked.checkout) {
+            if error.kind() != ErrorKind::CrossesDevices || trash != admin_trash {
+                return Err(error.into());
+            }
+            let local = local_trash_dir(path);
+            fs::create_dir_all(&local)?;
+            parked.checkout = local.join(&id);
+            fs::rename(path, &parked.checkout)?;
+        }
         Ok(parked)
     }
 
     fn recover(path: &Path, admin: &Path, common: &Path) -> Result<Option<Self>> {
         let admin_trash = common.join(TRASH_DIR);
-        let local_trash = path.parent().unwrap_or(path).join(format!(".{TRASH_DIR}"));
+        let local_trash = local_trash_dir(path);
+        let canonical_admin = admin.canonicalize()?;
         let mut parked = None;
         for trash in [&admin_trash, &local_trash] {
             let dirs = match fs::read_dir(trash) {
@@ -191,7 +340,8 @@ impl ParkedWorktree {
                 let checkout = entry.path();
                 if !entry.file_type()?.is_dir()
                     || !read_admin_dir(&checkout, path)
-                        .is_ok_and(|a| util::canon(&a) == util::canon(admin))
+                        .and_then(|candidate| candidate.canonicalize().map_err(Into::into))
+                        .is_ok_and(|candidate| candidate == canonical_admin)
                 {
                     continue;
                 }
@@ -213,14 +363,13 @@ impl ParkedWorktree {
     }
 
     fn unregister(&self, admin: &Path) -> Result<()> {
-        match fs::rename(admin, &self.admin) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound && !admin.try_exists()? => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("unregistering {}", admin.display())),
-        }
+        reject_mounts(&self.checkout)?;
+        reject_mounts(admin)?;
+        reject_submodule_worktrees(admin)?;
+        fs::rename(admin, &self.admin).with_context(|| format!("unregistering {}", admin.display()))
     }
 
-    fn finish(self, original: &Path, link: Option<&Path>, sync: bool) -> Result<i32> {
+    fn finish(self, original: &Path, link: Option<&Alias>, sync: bool) -> Result<i32> {
         let alias_cleanup = remove_link(link);
         let paths = [&*self.checkout, &*self.admin];
         if sync || !cfg!(unix) || spawn_sweeper(&paths).is_err() {
@@ -237,6 +386,7 @@ impl ParkedWorktree {
 #[cfg(target_os = "linux")]
 pub(crate) fn unregister(common: &Path, admin: &Path) -> Result<()> {
     validate_admin(common, admin)?;
+    reject_submodule_worktrees(admin)?;
     let trash = common.join(TRASH_DIR);
     fs::create_dir_all(&trash)?;
     let parked = trash.join(format!("overlay-admin-{}", std::process::id()));
@@ -250,23 +400,42 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         bail!("sharetree rm requires Git to discover each worktree from its path; unset {var}");
     }
     let cwd = std::env::current_dir()?;
-    let requested = util::absolutize(&a.path, &cwd);
-    let alias = requested
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink());
+    let requested = cwd.join(&a.path).components().collect::<PathBuf>();
+    let alias = match requested.symlink_metadata() {
+        Ok(info) => info.is_symlink(),
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("checking {}", requested.display())),
+    };
     let (target, link) = if alias {
         let target = fs::read_link(&requested)?;
-        let parent = requested.parent().unwrap_or(&cwd);
+        let parent = requested.parent().unwrap_or(&cwd).canonicalize()?;
         (
-            util::canon(&util::absolutize(&target, parent)),
-            Some(requested.as_path()),
+            checkout_path(&parent.join(&target))?,
+            Some(Alias {
+                path: parent.join(requested.file_name().context("missing alias name")?),
+                target,
+            }),
         )
     } else {
-        (util::canon(&requested), None)
+        (checkout_path(&requested)?, None)
     };
+    let link = link.as_ref();
     let common = git::common_dir(&cwd)?;
     let wts = git::list_worktrees(&cwd)?;
-    let wt = wts.iter().find(|w| util::canon(&w.path) == target);
+    let mut matching = Vec::new();
+    for w in &wts {
+        if checkout_path(&w.path)? == target {
+            matching.push(w);
+        }
+    }
+    let mut matches = matching.into_iter();
+    let wt = matches.next();
+    if matches.next().is_some() {
+        bail!(
+            "more than one Git registration belongs to {}",
+            target.display()
+        );
+    }
     if wt.is_some_and(|w| w.is_main) {
         bail!("refusing to remove the main worktree");
     }
@@ -325,12 +494,18 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         );
     }
 
-    if !wt.path.try_exists()? {
-        if let Some(admin) = registered_admin(&common, &wt.path)? {
-            if let Some(parked) = ParkedWorktree::recover(&wt.path, &admin, &common)? {
-                parked.unregister(&admin)?;
-                return parked.finish(&wt.path, link, a.sync);
-            }
+    if let Err(e) = wt.path.symlink_metadata() {
+        if e.kind() != ErrorKind::NotFound {
+            return Err(e).with_context(|| format!("checking {}", wt.path.display()));
+        }
+        let admin = registered_admin(&common, &wt.path)?.with_context(|| {
+            format!("cannot confirm Git registration for {}", wt.path.display())
+        })?;
+        reject_mounts(&admin)?;
+        reject_submodule_worktrees(&admin)?;
+        if let Some(parked) = ParkedWorktree::recover(&wt.path, &admin, &common)? {
+            parked.unregister(&admin)?;
+            return parked.finish(&wt.path, link, a.sync);
         }
         if ours && a.force < 2 {
             bail!(
@@ -342,8 +517,8 @@ pub fn run(args: &[OsString]) -> Result<i32> {
         return remove_with_git(&cwd, &wt.path, a.force, link);
     }
 
-    let admin = admin_dir(&wt.path)?;
-    validate_admin(&common, &admin)?;
+    reject_mounts(&wt.path)?;
+    let admin = checkout_admin(&common, &wt.path)?;
     if a.force == 0 {
         check_clean(&wt.path, &admin)?;
     }
@@ -351,6 +526,7 @@ pub fn run(args: &[OsString]) -> Result<i32> {
     let parked = match ParkedWorktree::begin(&wt.path, &common) {
         Ok(parked) => parked,
         Err(e) => {
+            checkout_admin(&common, &wt.path)?;
             eprintln!(
                 "sharetree: cannot park {} ({e}); using `git worktree remove`",
                 wt.path.display()
@@ -386,6 +562,10 @@ fn trash_dir_for(wt: &Path, common: &Path) -> PathBuf {
     }
     #[cfg(not(unix))]
     let _ = common;
+    local_trash_dir(wt)
+}
+
+fn local_trash_dir(wt: &Path) -> PathBuf {
     wt.parent().unwrap_or(wt).join(format!(".{TRASH_DIR}"))
 }
 
@@ -432,7 +612,32 @@ pub fn sweep_cmd(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
+fn reject_mounts(path: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).with_context(|| format!("resolving {}", path.display())),
+        };
+        if let Some(mount) = crate::volume::mounts()?
+            .into_iter()
+            .find(|mount| mount.mountpoint.starts_with(&path))
+        {
+            bail!(
+                "refusing to remove {} while {} is mounted",
+                path.display(),
+                mount.mountpoint.display()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    Ok(())
+}
+
 fn sweep(path: &Path) -> Result<()> {
+    reject_mounts(path)?;
     match fs::remove_dir_all(path) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}

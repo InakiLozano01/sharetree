@@ -583,7 +583,7 @@ mod engine {
     use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::Instant;
 
     use anyhow::{bail, Context, Result};
@@ -602,17 +602,30 @@ mod engine {
         head: String,
     }
 
-    struct Donor {
-        path: PathBuf,
-        tree: Arc<Tree>,
-        dirty: HashSet<Vec<u8>>,
-        score: usize,
+    #[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+    struct DonorScore {
+        bytes: u64,
+        files: usize,
     }
 
-    struct Analysis {
+    impl DonorScore {
+        fn plus(self, other: Self) -> Self {
+            Self {
+                bytes: self.bytes.saturating_add(other.bytes),
+                files: self.files + other.files,
+            }
+        }
+    }
+
+    struct ScannedTrees {
         sha: String,
-        target: Arc<Tree>,
-        donor: Option<Donor>,
+        trees: HashMap<String, Tree>,
+    }
+
+    struct DonorPlan<'a> {
+        path: &'a Path,
+        files: Vec<Planned<'a>>,
+        score: DonorScore,
     }
 
     #[derive(Default)]
@@ -843,16 +856,13 @@ mod engine {
             }
             Err(e) => return Err(e.context("cannot lock worktree registration")),
         };
-        let explicit = a.from.is_some();
         let t = Instant::now();
         let (status, early) = std::thread::scope(|s| {
             let h = s.spawn(move || {
                 let _lock = lock;
                 git::run_inherit(cwd, &add_args)
             });
-            let early = guess
-                .as_deref()
-                .map(|sha| analyze(cwd, sha, &cands, explicit, trace));
+            let early = guess.as_deref().map(|sha| scan_trees(cwd, sha, &cands));
             (h.join().expect("git worktree add thread"), early)
         });
         let status = status?;
@@ -864,12 +874,12 @@ mod engine {
 
         let prepared = (|| -> Result<_> {
             let target = git::rev_parse_commit(dest, OsStr::new("HEAD"))?;
-            let analysis = match early {
-                Some(Ok(an)) if an.sha == target => Ok(an),
-                _ => analyze(cwd, &target, &cands, explicit, trace),
+            let trees = match early {
+                Some(Ok(trees)) if trees.sha == target => Ok(trees),
+                _ => scan_trees(cwd, &target, &cands),
             };
-            let mut report = analysis
-                .and_then(|an| seed(dest, &an, a, trace))
+            let mut report = trees
+                .and_then(|trees| seed(dest, &trees, &cands, a, trace))
                 .unwrap_or_else(|e| {
                     eprintln!("sharetree: warning: seeding skipped: {e:#}");
                     SeedReport::default()
@@ -1048,88 +1058,115 @@ mod engine {
         first
             .into_iter()
             .chain(others.into_iter().map(|(_, c)| c))
-            .take(5)
             .collect()
     }
 
-    fn analyze(
-        repo: &Path,
-        sha: &str,
-        cands: &[Cand],
-        explicit: bool,
-        trace: &Trace,
-    ) -> Result<Analysis> {
-        let t = Instant::now();
-        let mut heads: Vec<&str> = vec![sha];
-        for c in cands {
-            if !heads.contains(&c.head.as_str()) {
-                heads.push(&c.head);
-            }
-        }
-        let mut trees: HashMap<String, Arc<Tree>> = std::thread::scope(|s| {
+    fn scan_trees(repo: &Path, sha: &str, cands: &[Cand]) -> Result<ScannedTrees> {
+        let mut seen = HashSet::new();
+        let heads: Vec<_> = std::iter::once(sha)
+            .chain(cands.iter().map(|c| c.head.as_str()))
+            .filter(|&head| seen.insert(head))
+            .collect();
+        let chunk = heads.len().div_ceil(util::workers(heads.len()));
+        let mut trees: HashMap<_, _> = std::thread::scope(|s| {
             let hs: Vec<_> = heads
-                .iter()
-                .map(|h| s.spawn(move || (h.to_string(), git::ls_tree(repo, h))))
+                .chunks(chunk)
+                .map(|heads| {
+                    s.spawn(move || {
+                        heads
+                            .iter()
+                            .filter_map(|&head| {
+                                git::ls_tree(repo, head).ok().map(|tree| (head, tree))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
                 .collect();
             hs.into_iter()
-                .filter_map(|h| h.join().ok())
-                .filter_map(|(h, t)| t.ok().map(|t| (h, Arc::new(t))))
+                .flat_map(|h| h.join().expect("ls-tree thread"))
+                .map(|(head, tree)| (head.to_string(), tree))
                 .collect()
         });
-        let target = match trees.remove(sha) {
-            Some(t) => t,
-            None => Arc::new(
-                git::ls_tree(repo, sha)
-                    .with_context(|| format!("cannot list the target tree {sha}"))?,
-            ),
-        };
-        let mut wanted: HashMap<&str, usize> = HashMap::new();
-        let mut regular_files = 0;
-        for entry in target.entries.values().filter(|e| e.is_regular()) {
-            *wanted.entry(&entry.oid).or_default() += 1;
-            regular_files += 1;
+        if !trees.contains_key(sha) {
+            let target = git::ls_tree(repo, sha)
+                .with_context(|| format!("cannot list the target tree {sha}"))?;
+            trees.insert(sha.to_string(), target);
         }
-        let score_of = |tree: &Tree, dirty: Option<&HashSet<Vec<u8>>>| {
+        Ok(ScannedTrees {
+            sha: sha.to_string(),
+            trees,
+        })
+    }
+
+    fn plan_donor<'a>(
+        dest: &Path,
+        scanned: &'a ScannedTrees,
+        cands: &'a [Cand],
+        a: &AddArgs,
+        trace: &Trace,
+    ) -> Result<Option<DonorPlan<'a>>> {
+        let t = Instant::now();
+        let target = &scanned.trees[&scanned.sha];
+        let mut paths: Vec<_> = target
+            .entries
+            .iter()
+            .filter(|(p, e)| e.is_regular() && e.size >= a.min_size && reusable_tree_path(p))
+            .map(|(p, _)| p.as_slice())
+            .collect();
+        paths.sort_unstable();
+        let reusable = attrs::reusable_paths(dest, &scanned.sha, &paths)?;
+        paths.retain(|&p| reusable.contains(p));
+        trace.phase("target eligibility", t);
+
+        let t = Instant::now();
+        let mut wanted: HashMap<&str, DonorScore> = HashMap::new();
+        for (path, entry) in &target.entries {
+            if reusable.contains(path) {
+                let weight = wanted.entry(&entry.oid).or_default();
+                weight.bytes = weight.bytes.saturating_add(entry.size);
+                weight.files += 1;
+            } else if a.warm && entry.is_regular() && reusable_tree_path(path) {
+                wanted.entry(&entry.oid).or_default().files += 1;
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let upper_bound = |tree: &Tree| {
             let mut seen = HashSet::new();
             tree.entries
                 .iter()
-                .filter(|(p, e)| e.is_regular() && dirty.is_none_or(|paths| !paths.contains(*p)))
-                .filter_map(|(_, e)| wanted.get_key_value(e.oid.as_str()))
+                .filter_map(|(p, e)| {
+                    wanted
+                        .get_key_value(e.oid.as_str())
+                        .filter(|_| e.is_regular() && reusable_tree_path(p))
+                })
                 .filter(|(oid, _)| seen.insert(**oid))
-                .map(|(_, &count)| count)
-                .sum::<usize>()
+                .map(|(_, &weight)| weight)
+                .fold(DonorScore::default(), DonorScore::plus)
         };
-        let scores: HashMap<&str, usize> = trees
+        let bounds: HashMap<_, _> = scanned
+            .trees
             .iter()
-            .map(|(head, tree)| (head.as_str(), score_of(tree, None)))
+            .map(|(head, tree)| (head.as_str(), (upper_bound(tree), tree)))
             .collect();
-        let mut ranked: Vec<(usize, usize, &Cand)> = cands
+        let mut ranked: Vec<_> = cands
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let score = if c.head == sha {
-                    regular_files
-                } else {
-                    scores.get(c.head.as_str()).copied().unwrap_or(0)
-                };
-                (score, i, c)
+            .filter_map(|c| {
+                let &(bound, tree) = bounds.get(c.head.as_str())?;
+                Some((bound, tree, c))
             })
             .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        ranked.sort_by_key(|(bound, _, _)| std::cmp::Reverse(*bound));
         trace.phase("score donors", t);
 
         let mut donor = None;
-        let mut best_score = 0;
-        for (score, _, c) in ranked.into_iter().take(3) {
-            if score <= best_score {
+        let mut best_score = DonorScore::default();
+        for (bound, tree, c) in ranked {
+            if bound <= best_score {
                 break;
             }
             let t = Instant::now();
-            let tree = if c.head == sha {
-                &target
-            } else {
-                &trees[&c.head]
-            };
             let dirty = match git::changed_tracked_paths(&c.path, true) {
                 Ok(paths) => paths,
                 Err(e) => {
@@ -1142,12 +1179,8 @@ mod engine {
                 .iter()
                 .filter(|path| tree.entries.get(*path).is_some_and(Entry::is_regular))
                 .count();
-            let total = if c.head == sha {
-                regular_files
-            } else {
-                tree.regular_count()
-            };
-            if !explicit && dirty_regular > total / 2 {
+            let total = tree.regular_count();
+            if a.from.is_none() && dirty_regular > total / 2 {
                 trace.note(format!(
                     "skipping donor {}: {} of {} tracked files differ from its HEAD",
                     c.path.display(),
@@ -1156,27 +1189,64 @@ mod engine {
                 ));
                 continue;
             }
-            let score = if dirty_regular == 0 {
-                score
-            } else {
-                score_of(tree, Some(&dirty))
-            };
+            let mut by_oid: HashMap<&str, Option<&[u8]>> = HashMap::new();
+            let mut available = HashSet::new();
+            for (path, entry) in &tree.entries {
+                if !wanted.contains_key(entry.oid.as_str())
+                    || !entry.is_regular()
+                    || dirty.contains(path)
+                    || !reusable_tree_path(path)
+                {
+                    continue;
+                }
+                let Ok(md) = fs::symlink_metadata(c.path.join(bytes_to_path(path))) else {
+                    continue;
+                };
+                if !reflink::is_plain_file(&md) {
+                    continue;
+                }
+                if md.len() == entry.size {
+                    let path = path.as_slice();
+                    let src = by_oid.entry(&entry.oid).or_default();
+                    *src = Some(src.map_or(path, |other| other.min(path)));
+                    available.insert(path);
+                } else if a.warm {
+                    by_oid.entry(&entry.oid).or_default();
+                }
+            }
+            let score = by_oid
+                .iter()
+                .map(|(&oid, src)| {
+                    let mut weight = wanted[oid];
+                    if src.is_none() {
+                        weight.bytes = 0;
+                    }
+                    weight
+                })
+                .fold(DonorScore::default(), DonorScore::plus);
             if score <= best_score {
                 continue;
             }
+            let files = paths
+                .iter()
+                .filter_map(|&dst| {
+                    let entry = &target.entries[dst];
+                    let src = if available.contains(dst) && tree.entries[dst].oid == entry.oid {
+                        dst
+                    } else {
+                        by_oid.get(entry.oid.as_str()).copied().flatten()?
+                    };
+                    Some(Planned { dst, src, entry })
+                })
+                .collect();
             best_score = score;
-            donor = Some(Donor {
-                path: c.path.clone(),
-                tree: Arc::clone(tree),
-                dirty,
+            donor = Some(DonorPlan {
+                path: &c.path,
+                files,
                 score,
             });
         }
-        Ok(Analysis {
-            sha: sha.to_string(),
-            target,
-            donor,
-        })
+        Ok(donor)
     }
 
     struct Planned<'a> {
@@ -1253,56 +1323,26 @@ mod engine {
         !numbered_device
     }
 
-    fn seed(dest: &Path, an: &Analysis, a: &AddArgs, trace: &Trace) -> Result<SeedReport> {
+    fn seed(
+        dest: &Path,
+        scanned: &ScannedTrees,
+        cands: &[Cand],
+        a: &AddArgs,
+        trace: &Trace,
+    ) -> Result<SeedReport> {
         let mut report = SeedReport::default();
-        let Some(d) = &an.donor else {
-            trace.note("no donor with matching files; plain checkout");
+        let Some(donor) = plan_donor(dest, scanned, cands, a, trace)? else {
+            trace.note("no donor with eligible files; plain checkout");
             return Ok(report);
         };
-        report.donor = Some(d.path.clone());
-        let t = Instant::now();
-
-        let mut by_oid: HashMap<&str, &[u8]> = HashMap::new();
-        for (p, e) in &d.tree.entries {
-            if e.is_regular() && !d.dirty.contains(p) && reusable_tree_path(p) {
-                let donor_path = by_oid.entry(e.oid.as_str()).or_insert(p.as_slice());
-                *donor_path = (*donor_path).min(p);
-            }
-        }
-        let mut plan: Vec<Planned> = Vec::new();
-        for (p, e) in &an.target.entries {
-            if !e.is_regular() || e.size < a.min_size || !reusable_tree_path(p) {
-                continue;
-            }
-            let src = match d.tree.entries.get(p) {
-                Some(de) if de.oid == e.oid && de.is_regular() && !d.dirty.contains(p) => {
-                    p.as_slice()
-                }
-                _ => match by_oid.get(e.oid.as_str()) {
-                    Some(sp) => sp,
-                    None => continue,
-                },
-            };
-            plan.push(Planned {
-                dst: p,
-                src,
-                entry: e,
-            });
-        }
-        plan.sort_by(|x, y| x.dst.cmp(y.dst));
-
-        if !plan.is_empty() {
-            let paths: Vec<&[u8]> = plan.iter().map(|p| p.dst).collect();
-            let reusable = attrs::reusable_paths(dest, &an.sha, &paths)?;
-            plan.retain(|p| reusable.contains(p.dst));
-        }
+        let plan = donor.files;
+        report.donor = Some(donor.path.to_path_buf());
         report.planned = plan.len();
-        trace.phase("plan", t);
         trace.note(format!(
-            "donor {} matches {} files; planned {} clones (>= {} bytes, no conversions)",
-            d.path.display(),
-            d.score,
+            "donor {}: planned {} clones ({}, >= {} bytes, no conversions)",
+            donor.path.display(),
             plan.len(),
+            human(donor.score.bytes),
             a.min_size
         ));
         if plan.is_empty() {
@@ -1343,7 +1383,7 @@ mod engine {
                             0o666
                         };
                         match reflink::clone_tracked(
-                            &d.path.join(bytes_to_path(p.src)),
+                            &donor.path.join(bytes_to_path(p.src)),
                             &dest.join(bytes_to_path(p.dst)),
                             create_mode,
                             p.entry.size,

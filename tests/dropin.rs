@@ -108,6 +108,108 @@ fn ranks_donors_after_excluding_locally_modified_files() {
 }
 
 #[test]
+fn ranks_a_clean_fourth_donor_above_three_dirty_donors() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join("big.bin"), &bytes(120, 4 * 1024 * 1024));
+    write(&main.join("medium-a.bin"), &bytes(121, 300_000));
+    write(&main.join("medium-b.bin"), &bytes(122, 300_000));
+    sb.commit_all(&main, "add three large files");
+    for path in ["../one", "../two", "../clean"] {
+        sb.git(&main, &["worktree", "add", "-q", "--detach", path]);
+    }
+    let clean = sb.p("clean");
+    sb.git(&clean, &["rm", "-q", "big.bin"]);
+    sb.git(&clean, &["commit", "-qm", "remove the largest file"]);
+    for donor in [&main, &sb.p("one"), &sb.p("two")] {
+        for path in ["big.bin", "medium-a.bin", "medium-b.bin"] {
+            write(&donor.join(path), b"local edit\n");
+        }
+    }
+
+    let err = sb.sharetree_ok(&main, &["add", "--min-size=200000", "--detach", "../cow"]);
+    assert_eq!(reflinked(&err), 2, "{err}");
+    assert!(err.contains(&format!("from {}", clean.display())), "{err}");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../stock"]);
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+}
+
+#[test]
+fn ranks_donors_without_counting_target_checkout_conversions() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join("big.bin"), &b"$Id$\n".repeat(100_000));
+    write(&main.join("medium-a.bin"), &bytes(130, 240_000));
+    write(&main.join("medium-b.bin"), &bytes(131, 240_000));
+    write(&main.join(".gitattributes"), b"big.bin ident\n");
+    sb.commit_all(&main, "convert the largest blob at checkout");
+    let clean = sb.p("clean");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../clean"]);
+    sb.git(&clean, &["rm", "-q", "big.bin", "empty", "small.txt"]);
+    sb.git(&clean, &["commit", "-qm", "remove the converted file"]);
+    for path in ["medium-a.bin", "medium-b.bin"] {
+        write(&main.join(path), b"local edit\n");
+    }
+
+    let err = sb.sharetree_ok(&main, &["add", "--min-size=200000", "--detach", "../cow"]);
+    assert_eq!(reflinked(&err), 2, "{err}");
+    assert!(err.contains(&format!("from {}", clean.display())), "{err}");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../stock"]);
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+}
+
+#[test]
+fn ranks_donors_without_counting_paths_excluded_by_the_destination() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join("omit/large.bin"), &bytes(140, 800_000));
+    write(&main.join("keep/medium-a.bin"), &bytes(141, 240_000));
+    write(&main.join("keep/medium-b.bin"), &bytes(142, 240_000));
+    sb.commit_all(&main, "add files inside and outside the sparse checkout");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../dense"]);
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../clean"]);
+    let dense = sb.p("dense");
+    sb.git(&dense, &["rm", "-qr", "keep"]);
+    sb.git(&dense, &["commit", "-qm", "remove the included files"]);
+    let clean = sb.p("clean");
+    sb.git(
+        &clean,
+        &["rm", "-q", "omit/large.bin", "empty", "small.txt"],
+    );
+    sb.git(&clean, &["commit", "-qm", "remove excluded files"]);
+    sb.git(&main, &["sparse-checkout", "set", "--no-cone", "/keep/"]);
+    for path in ["keep/medium-a.bin", "keep/medium-b.bin"] {
+        write(&main.join(path), b"local edit\n");
+    }
+    assert!(dense.join("omit/large.bin").is_file());
+
+    let err = compare_at(&sb, &main, "HEAD", "stock", "cow");
+    assert_eq!(reflinked(&err), 2, "{err}");
+    assert!(err.contains(&format!("from {}", clean.display())), "{err}");
+    assert!(!sb.p("cow/omit").exists());
+}
+
+#[test]
+fn ranks_donors_by_eligible_bytes() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    write(&main.join("medium-a.bin"), &bytes(150, 120_000));
+    write(&main.join("medium-b.bin"), &bytes(151, 120_000));
+    sb.commit_all(&main, "add two medium files");
+    let large = sb.p("large");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../large"]);
+    sb.git(&large, &["rm", "-q", "medium-a.bin", "medium-b.bin"]);
+    sb.git(&large, &["commit", "-qm", "remove the medium files"]);
+    write(&main.join("big.bin"), b"local edit\n");
+
+    let err = sb.sharetree_ok(&main, &["add", "--min-size=100000", "--detach", "../cow"]);
+    assert_eq!(reflinked(&err), 1, "{err}");
+    assert!(err.contains(&format!("from {}", large.display())), "{err}");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../stock"]);
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+}
+
+#[test]
 fn stat_clean_but_modified_donor() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);

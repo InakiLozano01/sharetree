@@ -128,7 +128,7 @@ pub fn common_dir(dir: &Path) -> Result<PathBuf> {
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn git_path(dir: &Path, name: &str) -> Result<PathBuf> {
@@ -136,12 +136,12 @@ pub fn git_path(dir: &Path, name: &str) -> Result<PathBuf> {
         dir,
         &["rev-parse", "--path-format=absolute", "--git-path", name],
     )?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
     let s = output(dir, &["rev-parse", "--show-toplevel"])?;
-    Ok(bytes_to_path(trim_nl(&s)))
+    Ok(bytes_to_path(s.strip_suffix(b"\n").unwrap_or(&s)))
 }
 
 pub fn trim_nl(b: &[u8]) -> &[u8] {
@@ -441,6 +441,16 @@ pub fn hook_exists(worktree: &Path, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_newlines_in_worktree_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("checkout\r\n");
+        std::fs::create_dir(&root).unwrap();
+        output(&root, &["init", "-q"]).unwrap();
+        assert_eq!(toplevel(&root).unwrap(), root);
+    }
 
     #[test]
     fn parses_worktree_porcelain() {

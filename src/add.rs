@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -63,6 +63,23 @@ fn parse_size(v: Option<&OsString>) -> Result<u64> {
         .map_err(|_| anyhow!("--min-size: not a number: {v}"))
 }
 
+fn short_options(arg: &OsStr) -> Option<(bool, bool)> {
+    let flags = arg.as_encoded_bytes().strip_prefix(b"-")?;
+    if flags.is_empty() {
+        return None;
+    }
+    let mut quiet = false;
+    for (i, &flag) in flags.iter().enumerate() {
+        match flag {
+            b'q' => quiet = true,
+            b'd' | b'f' => {}
+            b'b' | b'B' => return Some((quiet, i + 1 == flags.len())),
+            _ => return None,
+        }
+    }
+    Some((quiet, false))
+}
+
 pub fn parse(args: &[OsString]) -> Result<AddArgs> {
     let mut a = AddArgs {
         min_size: DEFAULT_MIN_SIZE,
@@ -72,6 +89,17 @@ pub fn parse(args: &[OsString]) -> Result<AddArgs> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if let Some((quiet, needs_value)) = short_options(arg) {
+            let end = i + 1 + usize::from(needs_value);
+            let options = args
+                .get(i..end)
+                .ok_or_else(|| anyhow!("{} requires a value", arg.to_string_lossy()))?;
+            a.quiet |= quiet;
+            a.forward.extend_from_slice(options);
+            a.git_args.extend_from_slice(options);
+            i = end;
+            continue;
+        }
         match arg.to_str() {
             Some("--") => {
                 a.separator = true;
@@ -121,15 +149,15 @@ pub fn parse(args: &[OsString]) -> Result<AddArgs> {
                 a.orphan = false;
                 a.git_args.push(arg.clone());
             }
-            Some("-q" | "--quiet") => {
-                a.quiet = true;
+            Some(s)
+                if (s.starts_with("--q") && "--quiet".starts_with(s))
+                    || (s.starts_with("--no-q") && "--no-quiet".starts_with(s)) =>
+            {
+                a.quiet = !s.starts_with("--no-");
                 a.forward.push(arg.clone());
                 a.git_args.push(arg.clone());
             }
-            Some(s)
-                if matches!(s, "-b" | "-B")
-                    || (s.starts_with("--reas") && "--reason".starts_with(s)) =>
-            {
+            Some(s) if s.starts_with("--reas") && "--reason".starts_with(s) => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| anyhow!("{} requires a value", arg.to_string_lossy()))?;
@@ -578,7 +606,22 @@ mod engine {
         path: PathBuf,
         tree: Arc<Tree>,
         dirty: HashSet<Vec<u8>>,
-        score: usize,
+        score: DonorScore,
+    }
+
+    #[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+    struct DonorScore {
+        clone_bytes: u64,
+        matching_files: usize,
+    }
+
+    impl DonorScore {
+        fn plus(self, other: Self) -> Self {
+            Self {
+                clone_bytes: self.clone_bytes.saturating_add(other.clone_bytes),
+                matching_files: self.matching_files + other.matching_files,
+            }
+        }
     }
 
     struct Analysis {
@@ -815,7 +858,6 @@ mod engine {
             }
             Err(e) => return Err(e.context("cannot lock worktree registration")),
         };
-        let explicit = a.from.is_some();
         let t = Instant::now();
         let (status, early) = std::thread::scope(|s| {
             let h = s.spawn(move || {
@@ -824,7 +866,7 @@ mod engine {
             });
             let early = guess
                 .as_deref()
-                .map(|sha| analyze(cwd, sha, &cands, explicit, trace));
+                .map(|sha| analyze(cwd, sha, &cands, a, trace));
             (h.join().expect("git worktree add thread"), early)
         });
         let status = status?;
@@ -838,7 +880,7 @@ mod engine {
             let target = git::rev_parse_commit(dest, OsStr::new("HEAD"))?;
             let analysis = match early {
                 Some(Ok(an)) if an.sha == target => Ok(an),
-                _ => analyze(cwd, &target, &cands, explicit, trace),
+                _ => analyze(cwd, &target, &cands, a, trace),
             };
             let mut report = analysis
                 .and_then(|an| seed(dest, &an, a, trace))
@@ -1028,7 +1070,7 @@ mod engine {
         repo: &Path,
         sha: &str,
         cands: &[Cand],
-        explicit: bool,
+        a: &AddArgs,
         trace: &Trace,
     ) -> Result<Analysis> {
         let t = Instant::now();
@@ -1055,34 +1097,52 @@ mod engine {
                     .with_context(|| format!("cannot list the target tree {sha}"))?,
             ),
         };
-        let mut wanted: HashMap<&str, usize> = HashMap::new();
+        let mut wanted: HashMap<&str, DonorScore> = HashMap::new();
+        let mut target_score = DonorScore::default();
         let mut regular_files = 0;
-        for entry in target.entries.values().filter(|e| e.is_regular()) {
-            *wanted.entry(&entry.oid).or_default() += 1;
+        for (path, entry) in target.entries.iter().filter(|(_, e)| e.is_regular()) {
             regular_files += 1;
+            if !reusable_tree_path(path) {
+                continue;
+            }
+            let weight = DonorScore {
+                clone_bytes: if entry.size >= a.min_size {
+                    entry.size
+                } else {
+                    0
+                },
+                matching_files: 1,
+            };
+            let score = wanted.entry(&entry.oid).or_default();
+            *score = score.plus(weight);
+            target_score = target_score.plus(weight);
         }
         let score_of = |tree: &Tree, dirty: Option<&HashSet<Vec<u8>>>| {
             let mut seen = HashSet::new();
             tree.entries
                 .iter()
                 .filter(|(p, e)| e.is_regular() && dirty.is_none_or(|paths| !paths.contains(*p)))
-                .filter_map(|(_, e)| wanted.get_key_value(e.oid.as_str()))
+                .filter_map(|(p, e)| {
+                    wanted
+                        .get_key_value(e.oid.as_str())
+                        .filter(|_| reusable_tree_path(p))
+                })
                 .filter(|(oid, _)| seen.insert(**oid))
-                .map(|(_, &count)| count)
-                .sum::<usize>()
+                .map(|(_, &score)| score)
+                .fold(DonorScore::default(), DonorScore::plus)
         };
-        let scores: HashMap<&str, usize> = trees
+        let scores: HashMap<&str, DonorScore> = trees
             .iter()
             .map(|(head, tree)| (head.as_str(), score_of(tree, None)))
             .collect();
-        let mut ranked: Vec<(usize, usize, &Cand)> = cands
+        let mut ranked: Vec<_> = cands
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let score = if c.head == sha {
-                    regular_files
+                    target_score
                 } else {
-                    scores.get(c.head.as_str()).copied().unwrap_or(0)
+                    scores.get(c.head.as_str()).copied().unwrap_or_default()
                 };
                 (score, i, c)
             })
@@ -1091,7 +1151,7 @@ mod engine {
         trace.phase("score donors", t);
 
         let mut donor = None;
-        let mut best_score = 0;
+        let mut best_score = DonorScore::default();
         for (score, _, c) in ranked.into_iter().take(3) {
             if score <= best_score {
                 break;
@@ -1119,7 +1179,7 @@ mod engine {
             } else {
                 tree.regular_count()
             };
-            if !explicit && dirty_regular > total / 2 {
+            if a.from.is_none() && dirty_regular > total / 2 {
                 trace.note(format!(
                     "skipping donor {}: {} of {} tracked files differ from its HEAD",
                     c.path.display(),
@@ -1271,11 +1331,11 @@ mod engine {
         report.planned = plan.len();
         trace.phase("plan", t);
         trace.note(format!(
-            "donor {} matches {} files; planned {} clones (>= {} bytes, no conversions)",
+            "donor {} matches {} files ({} above the size threshold); planned {} clones",
             d.path.display(),
-            d.score,
+            d.score.matching_files,
+            human(d.score.clone_bytes),
             plan.len(),
-            a.min_size
         ));
         if plan.is_empty() {
             return Ok(report);

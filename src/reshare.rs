@@ -233,10 +233,21 @@ mod imp {
         Ok((work, scope))
     }
 
-    fn plan_all(cwd: &Path, min_size: u64) -> Result<(Vec<Pair>, String)> {
+    fn git_dir_identity(dir: &[u8]) -> Option<(u64, u64)> {
+        let path = bytes_to_path(dir.strip_suffix(b"\n")?);
+        let metadata = path.metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    fn plan_all(cwd: &Path, min_size: u64, trace: &util::Trace) -> Result<(Vec<Pair>, String)> {
         let mut blobs = HashMap::new();
         let mut checkouts = 0;
         let device = cwd.metadata()?.dev();
+        let common_dir = git::output(
+            cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common_identity = git_dir_identity(&common_dir);
         for w in git::list_worktrees(cwd)? {
             if w.bare || w.prunable {
                 continue;
@@ -245,6 +256,31 @@ mod imp {
                 continue;
             };
             if !root.is_dir() || root.dev() != device {
+                continue;
+            }
+            let identity = git::output(
+                &w.path,
+                &[
+                    "rev-parse",
+                    "--show-cdup",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+            );
+            let is_same_repo_checkout = identity
+                .as_deref()
+                .ok()
+                .and_then(|output| output.strip_prefix(b"\n"))
+                .is_some_and(|dir| {
+                    dir == common_dir
+                        || common_identity
+                            .is_some_and(|identity| git_dir_identity(dir) == Some(identity))
+                });
+            if !is_same_repo_checkout {
+                trace.note(format!(
+                    "skipping worktree registration without a matching checkout at {}",
+                    w.path.display()
+                ));
                 continue;
             }
             checkouts += 1;
@@ -299,7 +335,7 @@ mod imp {
         let trace = util::Trace::new(a.verbose);
         let cwd = std::env::current_dir()?;
         let (work, scope) = if a.all {
-            plan_all(&cwd, a.min_size)?
+            plan_all(&cwd, a.min_size, &trace)?
         } else {
             plan_target(&cwd, &a)?
         };

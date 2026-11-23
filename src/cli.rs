@@ -31,7 +31,7 @@ add      Create a worktree like `git worktree add`, reflinking every tracked fil
                        (neither flag and auto_volume unset: ask on a terminal)
          --overlay     Linux, opt-in: fuse-overlayfs worktree over a shared base
                        checkout (whole-file copy-up on write, slower reads)
-         --windows-clone  Windows, experimental and untested: ReFS / Dev Drive
+         --windows-clone  Windows, experimental: ReFS / Dev Drive
                        block cloning (or windows_clone = true in the config)
          -v            show the donor, the plan and per-phase timings
 rm       Remove a worktree: same safety checks as `git worktree remove`, then the

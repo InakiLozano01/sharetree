@@ -293,10 +293,10 @@ pub(crate) fn run_ls(args: &[OsString]) -> Result<i32> {
 const WHY_DU_LIES: &str = "\
 `du` (APPARENT) adds up every file's blocks and cannot see that reflinked
 extents are shared, so it reports each worktree as a full copy. EXCLUSIVE is
-what deleting the worktree would free. On Btrfs it comes from
-`btrfs filesystem du -s`; otherwise it is a FIEMAP estimate. For a ground
-truth, compare `df` (statvfs free space) before and after, after `sync`, on an
-otherwise idle filesystem. Extents shared with snapshots count as shared.";
+an estimate of the size of file extents with a single reference. Extents
+can be shared within one worktree or with a snapshot. The estimate uses
+`btrfs filesystem du -s` or FIEMAP. To measure space freed by an operation,
+compare `df` before and after, after `sync`, on an otherwise idle filesystem.";
 
 pub(crate) fn run_du(args: &[OsString]) -> Result<i32> {
     let mut raw = false;

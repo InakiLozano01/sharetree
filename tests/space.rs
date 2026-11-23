@@ -306,6 +306,63 @@ exec git "$@"
 
 #[test]
 #[cfg(target_os = "linux")]
+fn reshare_all_skips_stale_checkout_registrations() {
+    let Some(sb) = Sandbox::btrfs() else { return };
+    let main = sb.repo("main", &[]);
+    let peer = sb.p("peer");
+    let nested = main.join("nested");
+    let replaced = sb.p("replaced");
+    for checkout in [&peer, &nested, &replaced] {
+        sb.git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                checkout.to_str().unwrap(),
+            ],
+        );
+    }
+    for checkout in [&nested, &replaced] {
+        sb.git(&main, &["worktree", "lock", checkout.to_str().unwrap()]);
+        fs::remove_dir_all(checkout).unwrap();
+    }
+    fs::create_dir(&nested).unwrap();
+    sb.repo("replaced", &[]);
+
+    let listed = sb.git(&main, &["worktree", "list", "--porcelain"]);
+    assert!(!listed.contains("prunable"), "{listed}");
+    assert_eq!(listed.lines().filter(|line| *line == "locked").count(), 2);
+
+    let err = sb.sharetree_ok(
+        &main,
+        &["reshare", "--all", "--min-size", "262144", "--verbose"],
+    );
+    assert!(
+        err.contains("shared 1 files") && err.contains("across 2 worktree(s)"),
+        "{err}"
+    );
+    for checkout in [&nested, &replaced] {
+        assert!(
+            err.contains(&format!(
+                "skipping worktree registration without a matching checkout at {}",
+                checkout.display()
+            )),
+            "{err}"
+        );
+    }
+
+    if let Some(unrelated) = btrfs_exclusive(&[replaced.join("big.bin")]) {
+        assert!(unrelated >= 300_000, "{unrelated}");
+        assert_eq!(btrfs_exclusive(&[peer.join("big.bin")]), Some(0));
+    } else {
+        assert!(!require_btrfs(), "`btrfs filesystem du` is required");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn reshare_all_reports_candidates_before_kernel_comparison() {
     let Some(sb) = Sandbox::btrfs() else { return };
     let main = sb.repo("main", &[]);

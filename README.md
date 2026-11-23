@@ -192,8 +192,9 @@ donor scoring:
    reflink support, OpenZFS gates its block cloning behind a setting, and
    overlayfs depends on the filesystem underneath.
 3. **Register.** It runs `git worktree add --no-checkout <your args>` and
-   ranks donors by how many target files they can supply by blob ID. The
-   final ranking excludes donor paths with local edits. A worktree with
+   ranks donors by the bytes they can supply by blob ID above the clone size
+   threshold, using matching file count to break ties. The final ranking
+   excludes donor paths with local edits. A worktree with
    mostly modified files is likely still being populated and is skipped.
 4. **Plan.** A target file is cloned only when all of these hold:
    - it is a regular file of at least `--min-size` bytes;
@@ -244,8 +245,9 @@ behind checkout verification and the other worktree backends.
 ## Why `du` lies, and how to measure
 
 `du` adds up each file's blocks and cannot tell that two files share them. Ten
-reflinked worktrees look like ten full copies. The number that matters is
-**exclusive** bytes: what deleting the worktree would free.
+reflinked worktrees look like ten full copies. **Exclusive** bytes estimate
+the size of file extents with a single reference. Extents shared by files
+within the same worktree can also be freed when the entire worktree is removed.
 
 - **Btrfs:** `btrfs filesystem du -s <paths>` prints Total, Exclusive and Set
   shared, using the FIEMAP ioctl. Pass the worktree's top-level entries, not
@@ -256,11 +258,8 @@ reflinked worktrees look like ten full copies. The number that matters is
   is the ground truth.
 - **XFS** has no `btrfs fi du` equivalent. The FIEMAP ioctl flags every
   extent another file also references (`FIEMAP_EXTENT_SHARED`), so the sum of
-  the *unshared* extents of a worktree's files is what deleting it frees.
+  the *unshared* extents measures their exclusive bytes.
   `xfs_io -c fiemap -v <file>` shows the flags by hand.
-- **Any filesystem:** compare free space (`df`) before and after creating a
-  worktree. Run `sync` first and wait, on an otherwise idle filesystem. This
-  is the ground truth.
 - **`sharetree ls` / `sharetree du`:** `btrfs filesystem du` on Btrfs; on
   XFS and other Linux filesystems with FIEMAP, the unshared-extent sum
   above. That sum is exact for extents shared between worktrees, but it

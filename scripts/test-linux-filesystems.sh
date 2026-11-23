@@ -198,6 +198,7 @@ if [[ $filesystem == btrfs ]]; then
     run_scenario space btrfs_exclusive_bytes_are_near_zero
     run_scenario space reshare_recovers_sharing_after_git_rewrites
     run_scenario space reshare_all_inventories_each_checkout_once_and_recovers_sharing
+    run_scenario space reshare_all_skips_stale_checkout_registrations
     run_scenario space reshare_all_reports_candidates_before_kernel_comparison
     run_scenario space reshare_all_tries_an_alternate_donor
     run_scenario space reshare_isolates_failed_filters

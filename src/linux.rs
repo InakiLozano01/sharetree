@@ -124,8 +124,7 @@ pub enum DedupeOutcome {
     Failed(u64, io::Error),
 }
 
-pub fn dedupe(src: &File, dst: &File, len: u64) -> DedupeOutcome {
-    let mut offset = 0u64;
+pub fn dedupe(src: &File, dst: &File, mut offset: u64, len: u64) -> DedupeOutcome {
     while offset < len {
         let length = (len - offset).min(CHUNK);
         let mut r = DedupeRange {

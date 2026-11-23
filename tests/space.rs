@@ -442,4 +442,26 @@ fn reshare_reports_confirmed_bytes_before_a_later_mismatch() {
         "{result}"
     );
     assert_eq!(fs::read(peer.join("large")).unwrap(), different);
+
+    let alternate = sb.p("alternate");
+    sb.git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            alternate.to_str().unwrap(),
+        ],
+    );
+    sb.git(&alternate, &["update-index", "--assume-unchanged", "large"]);
+    let mut alternate_bytes = different.clone();
+    alternate_bytes[0] ^= 1;
+    write(&alternate.join("large"), &alternate_bytes);
+    let result = sb.sharetree_ok(&peer, &["reshare", "--min-size", "1048576"]);
+    assert!(
+        result.contains("shared 1 files (17.0 MiB)") && result.contains("0 differ"),
+        "{result}"
+    );
+    assert_eq!(fs::read(peer.join("large")).unwrap(), different);
 }

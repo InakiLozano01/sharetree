@@ -126,8 +126,19 @@ mod imp {
                 .map(|(path, _, _)| path.as_slice())
                 .collect::<Vec<_>>();
             let mut dirty = std::collections::HashSet::new();
-            for batch in paths.chunks(16) {
-                isolate_changes(wt, batch, &mut dirty);
+            let mut start = 0;
+            let mut bytes = 0;
+            for (i, path) in paths.iter().enumerate() {
+                let size = path.len() + 32;
+                if i > start && bytes + size > 64 * 1024 {
+                    isolate_changes(wt, &paths[start..i], &mut dirty);
+                    start = i;
+                    bytes = 0;
+                }
+                bytes += size;
+            }
+            if start < paths.len() {
+                isolate_changes(wt, &paths[start..], &mut dirty);
             }
             dirty
         });
@@ -318,6 +329,7 @@ mod imp {
                     };
                     let mut saw_difference = false;
                     let mut accepted = false;
+                    let mut confirmed = 0;
                     for src in sources {
                         let Ok(sf) = open_ro(src) else { continue };
                         let Ok(sm) = sf.metadata() else { continue };
@@ -330,7 +342,7 @@ mod imp {
                         {
                             continue;
                         }
-                        if same_extents(&sf, &df) {
+                        if confirmed == 0 && same_extents(&sf, &df) {
                             already.fetch_add(1, Ordering::Relaxed);
                             accepted = true;
                             break;
@@ -341,30 +353,27 @@ mod imp {
                             accepted = true;
                             break;
                         }
-                        let (confirmed, complete) = match linux::dedupe(&sf, &df, *len) {
-                            DedupeOutcome::Deduped(n) => (n, true),
+                        match linux::dedupe(&sf, &df, confirmed, *len) {
+                            DedupeOutcome::Deduped(n) => {
+                                confirmed = n;
+                                accepted = true;
+                                break;
+                            }
                             DedupeOutcome::Differs(n) => {
+                                confirmed = n;
                                 saw_difference = true;
-                                (n, false)
                             }
                             DedupeOutcome::Failed(n, e) => {
+                                confirmed = n;
                                 if a.verbose {
                                     eprintln!("sharetree: {}: {e}", dst.display());
                                 }
-                                if n > 0 {
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                }
-                                (n, false)
                             }
-                        };
-                        if confirmed == 0 {
-                            continue;
                         }
+                    }
+                    if confirmed > 0 {
                         files.fetch_add(1, Ordering::Relaxed);
                         bytes.fetch_add(confirmed, Ordering::Relaxed);
-                        if !complete && saw_difference {
-                            differ.fetch_add(1, Ordering::Relaxed);
-                        }
                         if let Ok(after) = df.metadata() {
                             if (
                                 after.mtime(),
@@ -380,8 +389,6 @@ mod imp {
                                 stat_moved.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        accepted = true;
-                        break;
                     }
                     if !accepted {
                         if saw_difference {

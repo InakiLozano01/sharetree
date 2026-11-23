@@ -617,9 +617,9 @@ mod engine {
         }
     }
 
-    struct ScannedTrees {
+    struct ScannedTarget {
         sha: String,
-        trees: HashMap<String, Tree>,
+        tree: Tree,
     }
 
     struct DonorPlan<'a> {
@@ -862,7 +862,7 @@ mod engine {
                 let _lock = lock;
                 git::run_inherit(cwd, &add_args)
             });
-            let early = guess.as_deref().map(|sha| scan_trees(cwd, sha, &cands));
+            let early = guess.as_deref().map(|sha| scan_target(cwd, sha));
             (h.join().expect("git worktree add thread"), early)
         });
         let status = status?;
@@ -870,16 +870,16 @@ mod engine {
             return Ok(status.code().unwrap_or(1));
         }
         let mut lifecycle = Lifecycle::Planned.advance(Lifecycle::Registered)?;
-        trace.phase("register+scan", t);
+        trace.phase("register+scan target", t);
 
         let prepared = (|| -> Result<_> {
             let target = git::rev_parse_commit(dest, OsStr::new("HEAD"))?;
-            let trees = match early {
-                Some(Ok(trees)) if trees.sha == target => Ok(trees),
-                _ => scan_trees(cwd, &target, &cands),
+            let scanned = match early {
+                Some(Ok(scanned)) if scanned.sha == target => Ok(scanned),
+                _ => scan_target(cwd, &target),
             };
-            let mut report = trees
-                .and_then(|trees| seed(dest, &trees, &cands, a, trace))
+            let mut report = scanned
+                .and_then(|scanned| seed(dest, &scanned, &cands, a, trace))
                 .unwrap_or_else(|e| {
                     eprintln!("sharetree: warning: seeding skipped: {e:#}");
                     SeedReport::default()
@@ -1061,52 +1061,24 @@ mod engine {
             .collect()
     }
 
-    fn scan_trees(repo: &Path, sha: &str, cands: &[Cand]) -> Result<ScannedTrees> {
-        let mut seen = HashSet::new();
-        let heads: Vec<_> = std::iter::once(sha)
-            .chain(cands.iter().map(|c| c.head.as_str()))
-            .filter(|&head| seen.insert(head))
-            .collect();
-        let chunk = heads.len().div_ceil(util::workers(heads.len()));
-        let mut trees: HashMap<_, _> = std::thread::scope(|s| {
-            let hs: Vec<_> = heads
-                .chunks(chunk)
-                .map(|heads| {
-                    s.spawn(move || {
-                        heads
-                            .iter()
-                            .filter_map(|&head| {
-                                git::ls_tree(repo, head).ok().map(|tree| (head, tree))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            hs.into_iter()
-                .flat_map(|h| h.join().expect("ls-tree thread"))
-                .map(|(head, tree)| (head.to_string(), tree))
-                .collect()
-        });
-        if !trees.contains_key(sha) {
-            let target = git::ls_tree(repo, sha)
-                .with_context(|| format!("cannot list the target tree {sha}"))?;
-            trees.insert(sha.to_string(), target);
-        }
-        Ok(ScannedTrees {
+    fn scan_target(repo: &Path, sha: &str) -> Result<ScannedTarget> {
+        let tree = git::ls_tree(repo, sha)
+            .with_context(|| format!("cannot list the target tree {sha}"))?;
+        Ok(ScannedTarget {
             sha: sha.to_string(),
-            trees,
+            tree,
         })
     }
 
     fn plan_donor<'a>(
         dest: &Path,
-        scanned: &'a ScannedTrees,
+        scanned: &'a ScannedTarget,
         cands: &'a [Cand],
         a: &AddArgs,
         trace: &Trace,
     ) -> Result<Option<DonorPlan<'a>>> {
         let t = Instant::now();
-        let target = &scanned.trees[&scanned.sha];
+        let target = &scanned.tree;
         let mut paths: Vec<_> = target
             .entries
             .iter()
@@ -1117,6 +1089,9 @@ mod engine {
         let reusable = attrs::reusable_paths(dest, &scanned.sha, &paths)?;
         paths.retain(|&p| reusable.contains(p));
         trace.phase("target eligibility", t);
+        if paths.is_empty() && !a.warm {
+            return Ok(None);
+        }
 
         let t = Instant::now();
         let mut wanted: HashMap<&str, DonorScore> = HashMap::new();
@@ -1145,27 +1120,63 @@ mod engine {
                 .map(|(_, &weight)| weight)
                 .fold(DonorScore::default(), DonorScore::plus)
         };
-        let bounds: HashMap<_, _> = scanned
-            .trees
-            .iter()
-            .map(|(head, tree)| (head.as_str(), (upper_bound(tree), tree)))
+        let heads: HashSet<_> = cands.iter().map(|c| c.head.as_str()).collect();
+        let other_heads: Vec<_> = heads
+            .into_iter()
+            .filter(|&head| head != scanned.sha)
             .collect();
+        let chunk = other_heads
+            .len()
+            .div_ceil(util::workers(other_heads.len()))
+            .max(1);
+        let mut bounds: HashMap<_, _> = std::thread::scope(|s| {
+            let upper_bound = &upper_bound;
+            let workers: Vec<_> = other_heads
+                .chunks(chunk)
+                .map(|heads| {
+                    s.spawn(move || {
+                        heads
+                            .iter()
+                            .filter_map(|&head| {
+                                let tree = git::ls_tree(dest, head).ok()?;
+                                Some((head, upper_bound(&tree)))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("ls-tree thread"))
+                .collect()
+        });
+        bounds.insert(scanned.sha.as_str(), upper_bound(target));
         let mut ranked: Vec<_> = cands
             .iter()
-            .filter_map(|c| {
-                let &(bound, tree) = bounds.get(c.head.as_str())?;
-                Some((bound, tree, c))
-            })
+            .filter_map(|c| Some((*bounds.get(c.head.as_str())?, c)))
             .collect();
-        ranked.sort_by_key(|(bound, _, _)| std::cmp::Reverse(*bound));
+        ranked.sort_by_key(|(bound, _)| std::cmp::Reverse(*bound));
         trace.phase("score donors", t);
 
         let mut donor = None;
         let mut best_score = DonorScore::default();
-        for (bound, tree, c) in ranked {
+        for (bound, c) in ranked {
             if bound <= best_score {
                 break;
             }
+            let donor_tree;
+            let tree = if c.head == scanned.sha {
+                target
+            } else {
+                match git::ls_tree(dest, &c.head) {
+                    Ok(tree) => donor_tree = tree,
+                    Err(e) => {
+                        trace.note(format!("skipping donor {}: {e:#}", c.path.display()));
+                        continue;
+                    }
+                }
+                &donor_tree
+            };
             let t = Instant::now();
             let dirty = match git::changed_tracked_paths(&c.path, true) {
                 Ok(paths) => paths,
@@ -1189,8 +1200,8 @@ mod engine {
                 ));
                 continue;
             }
+            let mut sources = Vec::new();
             let mut by_oid: HashMap<&str, Option<&[u8]>> = HashMap::new();
-            let mut available = HashSet::new();
             for (path, entry) in &tree.entries {
                 if !wanted.contains_key(entry.oid.as_str())
                     || !entry.is_regular()
@@ -1205,14 +1216,27 @@ mod engine {
                 if !reflink::is_plain_file(&md) {
                     continue;
                 }
-                if md.len() == entry.size {
-                    let path = path.as_slice();
-                    let src = by_oid.entry(&entry.oid).or_default();
-                    *src = Some(src.map_or(path, |other| other.min(path)));
-                    available.insert(path);
-                } else if a.warm {
+                if a.warm {
                     by_oid.entry(&entry.oid).or_default();
                 }
+                if !paths.is_empty() && entry.size >= a.min_size && md.len() == entry.size {
+                    sources.push(path.as_slice());
+                }
+            }
+            let available = match attrs::reusable_paths(&c.path, &c.head, &sources) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    trace.note(format!(
+                        "cannot check donor attributes in {}: {e:#}",
+                        c.path.display()
+                    ));
+                    HashSet::new()
+                }
+            };
+            for path in &available {
+                let src = by_oid.entry(&tree.entries[path].oid).or_default();
+                let path = path.as_slice();
+                *src = Some(src.map_or(path, |other| other.min(path)));
             }
             let score = by_oid
                 .iter()
@@ -1236,7 +1260,11 @@ mod engine {
                     } else {
                         by_oid.get(entry.oid.as_str()).copied().flatten()?
                     };
-                    Some(Planned { dst, src, entry })
+                    Some(Planned {
+                        dst,
+                        src: src.to_vec(),
+                        entry,
+                    })
                 })
                 .collect();
             best_score = score;
@@ -1251,7 +1279,7 @@ mod engine {
 
     struct Planned<'a> {
         dst: &'a [u8],
-        src: &'a [u8],
+        src: Vec<u8>,
         entry: &'a Entry,
     }
 
@@ -1325,7 +1353,7 @@ mod engine {
 
     fn seed(
         dest: &Path,
-        scanned: &ScannedTrees,
+        scanned: &ScannedTarget,
         cands: &[Cand],
         a: &AddArgs,
         trace: &Trace,
@@ -1383,7 +1411,7 @@ mod engine {
                             0o666
                         };
                         match reflink::clone_tracked(
-                            &donor.path.join(bytes_to_path(p.src)),
+                            &donor.path.join(bytes_to_path(&p.src)),
                             &dest.join(bytes_to_path(p.dst)),
                             create_mode,
                             p.entry.size,

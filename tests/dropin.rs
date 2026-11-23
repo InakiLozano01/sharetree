@@ -135,6 +135,94 @@ fn ranks_a_clean_fourth_donor_above_three_dirty_donors() {
 }
 
 #[test]
+fn same_length_smudge_donor_does_not_mask_raw_donor() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    let raw = b"raw content\n".repeat(40_000);
+    write(&main.join("large.txt"), &raw);
+    write(&main.join(".gitignore"), b"node_modules/\n");
+    let target = sb.commit_all(&main, "raw target");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../raw"]);
+    sb.git(&main, &["config", "filter.case.smudge", "tr a-z A-Z"]);
+    sb.git(&main, &["config", "filter.case.clean", "tr A-Z a-z"]);
+    write(&main.join(".gitattributes"), b"large.txt filter=case\n");
+    sb.commit_all(&main, "smudge donor");
+    fs::remove_file(main.join("large.txt")).unwrap();
+    sb.git(&main, &["checkout", "--", "large.txt"]);
+    assert_eq!(
+        fs::read(main.join("large.txt")).unwrap(),
+        raw.to_ascii_uppercase()
+    );
+    assert!(sb.git(&main, &["status", "--porcelain"]).is_empty());
+
+    let cache = bytes(321, 8192);
+    write(&sb.p("raw/node_modules/cache"), &cache);
+    write(&main.join("node_modules/cache"), &bytes(654, 8192));
+    let err = sb.sharetree_ok(
+        &main,
+        &[
+            "add",
+            "--warm",
+            "--min-size=400000",
+            "--detach",
+            "../cow",
+            &target,
+        ],
+    );
+    assert_eq!(reflinked(&err), 1, "{err}");
+    assert!(
+        err.contains(&format!("from {}", sb.p("raw").display())),
+        "{err}"
+    );
+    assert_eq!(fs::read(sb.p("cow/node_modules/cache")).unwrap(), cache);
+    fs::remove_dir_all(sb.p("cow/node_modules")).unwrap();
+    sb.git(
+        &main,
+        &["worktree", "add", "-q", "--detach", "../stock", &target],
+    );
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+}
+
+#[test]
+fn empty_clone_plan_does_not_list_divergent_donor_trees() {
+    let Some(sb) = Sandbox::reflink() else { return };
+    let main = sb.repo("main", &[]);
+    for path in ["../one", "../two", "../three"] {
+        sb.git(&main, &["worktree", "add", "-q", "--detach", path]);
+        sb.git(&main.join(path), &["commit", "--allow-empty", "-qm", path]);
+    }
+    let git_trace = sb.p("git-trace");
+    let out = sb
+        .sharetree_cmd(&main)
+        .env("GIT_TRACE2_EVENT", &git_trace)
+        .args(["add", "--min-size=1000000", "--detach", "../cow"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(reflinked(&err), 0, "{err}");
+    let trace = fs::read_to_string(git_trace).unwrap();
+    let listings: Vec<_> = trace
+        .lines()
+        .filter(|line| line.contains(r#""argv":["git","ls-tree","#))
+        .collect();
+    assert_eq!(listings.len(), 1, "{listings:?}");
+    sb.git(&main, &["worktree", "add", "-q", "--detach", "../stock"]);
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("cow"));
+
+    write(&main.join(".git/info/exclude"), b"node_modules/\n");
+    let cache = bytes(42, 8192);
+    write(&main.join("node_modules/cache"), &cache);
+    sb.sharetree_ok(
+        &main,
+        &["add", "--warm", "--min-size=1000000", "--detach", "../warm"],
+    );
+    assert_eq!(fs::read(sb.p("warm/node_modules/cache")).unwrap(), cache);
+    fs::remove_dir_all(sb.p("warm/node_modules")).unwrap();
+    assert_equivalent(&sb, &sb.p("stock"), &sb.p("warm"));
+}
+
+#[test]
 fn ranks_donors_without_counting_target_checkout_conversions() {
     let Some(sb) = Sandbox::reflink() else { return };
     let main = sb.repo("main", &[]);

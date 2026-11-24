@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -307,6 +308,77 @@ fn scenario(kind: &str) {
         mp.display()
     );
     assert_equivalent(&sb, &sb.p("stock"), &cow);
+
+    let hook = main.join(".git/hooks/post-checkout");
+    write(&hook, b"#!/bin/sh\nexit 42\n");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let add = |path: &Path, from, options: &[&str]| {
+        let mut command = sb.sharetree_cmd(&main);
+        command
+            .env("SHARETREE_CONFIG", &cfg)
+            .args(["add", "--into-volume", "--detach"])
+            .args(options);
+        if let Some(from) = from {
+            command.arg("--from").arg(from);
+        }
+        command.arg(path).output().unwrap()
+    };
+
+    let worktrees_before = sb.git(&main, &["worktree", "list", "--porcelain"]);
+    let attributes = main.join(".git/info/attributes");
+    write(&attributes, b"big.bin filter=broken\n");
+    sb.git(&main, &["config", "filter.broken.smudge", "false"]);
+    sb.git(&main, &["config", "filter.broken.required", "true"]);
+    for from in [None, Some(&main)] {
+        let failed = sb.p("checkout-failed");
+        let out = add(&failed, from, &[]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("smudge filter broken failed"), "{err}");
+        assert!(!out.status.success() && out.status.code() != Some(42));
+        assert!(failed.symlink_metadata().is_err());
+        assert!(!real.with_file_name("checkout-failed").exists());
+        assert_eq!(
+            sb.git(&main, &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+    }
+    std::fs::remove_file(attributes).unwrap();
+
+    for from in [None, Some(&main)] {
+        let hooked = sb.p("hook-failed");
+        let out = add(&hooked, from, &[]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(42), "{err}");
+        assert!(
+            hooked.is_symlink(),
+            "the checkout must remain accessible at the requested path: {err}"
+        );
+        assert!(std::fs::read_link(&hooked).unwrap().starts_with(&mp));
+        assert_equivalent(&sb, &sb.p("stock"), &hooked);
+        ok(
+            &sb,
+            &main,
+            &cfg,
+            &["rm", "--sync", &hooked.to_string_lossy()],
+        );
+    }
+
+    write(&hook, b"#!/bin/sh\nprintf '[' > .sharetree.toml\nexit 42\n");
+    let hooked = sb.p("hook-and-warm-failed");
+    let out = add(&hooked, None, &["--warm"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(".sharetree.toml"), "{err}");
+    assert_eq!(out.status.code(), Some(42), "{err}");
+    assert!(hooked.is_symlink(), "{err}");
+    std::fs::remove_file(hooked.join(".sharetree.toml")).unwrap();
+    ok(
+        &sb,
+        &main,
+        &cfg,
+        &["rm", "--sync", &hooked.to_string_lossy()],
+    );
+    std::fs::remove_file(hook).unwrap();
+
     let list = sb.git(&main, &["worktree", "list", "--porcelain"]);
     assert!(list.contains("locked sharetree seed"), "{list}");
     assert!(list.contains("locked sharetree volume"), "{list}");

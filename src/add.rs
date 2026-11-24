@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -214,11 +215,25 @@ pub fn run(args: &[OsString]) -> Result<i32> {
 const NO_CLONE: &str =
     "copy-on-write worktrees are not enabled on this platform (ReFS block cloning is off by default, see README)";
 
+enum CheckoutOutcome {
+    Populated(i32),
+    Unpopulated(i32),
+    Delegated(ExitStatus),
+}
+
+impl CheckoutOutcome {
+    fn code(&self) -> i32 {
+        match *self {
+            Self::Populated(code) | Self::Unpopulated(code) => code,
+            Self::Delegated(status) => status.code().unwrap_or(1),
+        }
+    }
+}
+
 fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
     let cwd = std::env::current_dir()?;
     let dest = cwd.join(a.path.as_ref().expect("checked by caller"));
-    let plain =
-        |why: &str| -> Result<(i32, PathBuf)> { Ok((delegate(a, &cwd, why)?, dest.clone())) };
+    let plain = |why: &str| Ok((delegate(a, &cwd, why)?.code(), dest.clone()));
 
     let cfg = cfg!(windows).then(Config::load);
     let clone_enabled = cfg!(unix)
@@ -292,12 +307,12 @@ fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
         backend::Platform::current(),
     );
     trace.note(format!("backend: {decision:?}"));
-    let fallback = |hint| Ok((probe.fallback(a, &cwd, &hint)?, dest.clone()));
+    let fallback = |hint| Ok((probe.fallback(a, &cwd, &hint)?.code(), dest.clone()));
     let v = match decision {
         Decision::Fail(msg) => bail!(msg),
         Decision::Reflink => {
-            let code = probe.create(a, &cwd, &dest, None, &trace)?;
-            return Ok((code, dest));
+            let outcome = probe.create(a, &cwd, &dest, None, &trace)?;
+            return Ok((outcome.code(), dest));
         }
         Decision::Plain(hint) => return fallback(hint),
         Decision::Volume(v) => v,
@@ -313,7 +328,7 @@ fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
     };
 
     let placement = Placement::prepare(a, &cwd, &common, &dest, v)?;
-    let code = if clone_enabled {
+    let outcome = if clone_enabled {
         #[cfg(any(unix, windows))]
         {
             let donor = engine::ensure_seed(&cwd, &placement.repo_root, a, &trace)?;
@@ -336,9 +351,19 @@ fn dispatch(a: &AddArgs) -> Result<(i32, PathBuf)> {
             "placing the worktree in the Dev Drive (sharetree does not block-clone on Windows yet)",
         )?
     };
-    if code == 0 {
+    let code = outcome.code();
+    if placement.has_checkout(&outcome, &cwd) {
         let quiet = a.quiet || (dest_in_volume && probe.succeeded());
-        placement.finish(v, quiet)?;
+        if let Err(err) = placement.finish(v, quiet) {
+            if code == 0 {
+                return Err(err);
+            }
+            eprintln!(
+                "sharetree: warning: could not publish the worktree at {} ({err:#}). The checkout lives at {}",
+                dest.display(),
+                placement.real.display()
+            );
+        }
     }
     Ok((code, placement.real))
 }
@@ -375,7 +400,7 @@ impl CloneProbe {
         matches!(self, Self::Succeeded(_))
     }
 
-    fn fallback(&self, a: &AddArgs, cwd: &Path, hint: &Hint) -> Result<i32> {
+    fn fallback(&self, a: &AddArgs, cwd: &Path, hint: &Hint) -> Result<CheckoutOutcome> {
         let (reason, fs) = match self {
             Self::Failed { anchor, reason } => {
                 let fs = fs_label(anchor);
@@ -386,13 +411,13 @@ impl CloneProbe {
             }
             _ => (NO_CLONE.to_owned(), "NTFS"),
         };
-        let code = delegate(a, cwd, &reason)?;
+        let outcome = delegate(a, cwd, &reason)?;
         if !a.quiet {
             if let Some(t) = backend::hint_text(hint, fs) {
                 eprintln!("sharetree: {t}");
             }
         }
-        Ok(code)
+        Ok(outcome)
     }
 
     fn create(
@@ -402,7 +427,7 @@ impl CloneProbe {
         dest: &Path,
         donor: Option<&Path>,
         trace: &Trace,
-    ) -> Result<i32> {
+    ) -> Result<CheckoutOutcome> {
         #[cfg(any(unix, windows))]
         if let Self::Succeeded(anchor) = self {
             return engine::create(a, cwd, dest, anchor, donor, trace);
@@ -476,7 +501,57 @@ struct Placement {
     real: PathBuf,
     repo_root: PathBuf,
     args: AddArgs,
+    #[cfg(unix)]
+    reservation: Option<AliasTarget>,
     _volume_lock: std::fs::File,
+}
+
+#[cfg(unix)]
+struct AliasTarget {
+    path: PathBuf,
+    directory: std::fs::File,
+}
+
+#[cfg(unix)]
+impl AliasTarget {
+    fn reserve(parent: &Path, name: &str) -> Result<Self> {
+        loop {
+            let path = volume::unique_child(parent, name);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    let directory = std::fs::File::open(&path)
+                        .inspect_err(|_| {
+                            let _ = std::fs::remove_dir(&path);
+                        })
+                        .with_context(|| format!("opening {}", path.display()))?;
+                    return Ok(Self { path, directory });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("creating {}", path.display()))
+                }
+            }
+        }
+    }
+
+    fn still_owns_path(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        self.directory.metadata().is_ok_and(|held| {
+            self.path
+                .symlink_metadata()
+                .is_ok_and(|current| current.dev() == held.dev() && current.ino() == held.ino())
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AliasTarget {
+    fn drop(&mut self) {
+        if self.still_owns_path() {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
 }
 
 impl Placement {
@@ -502,6 +577,8 @@ impl Placement {
         let repo_root = volume::worktrees_root(current, &mp).join(volume::repo_id(common, &main));
         std::fs::create_dir_all(&repo_root)
             .with_context(|| format!("creating {}", repo_root.display()))?;
+        #[cfg(unix)]
+        let mut reservation = None;
         let real = if in_mount(requested, Some(&mp)) {
             requested.to_path_buf()
         } else {
@@ -519,6 +596,14 @@ impl Placement {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "worktree".into());
+            #[cfg(unix)]
+            {
+                let target = AliasTarget::reserve(&repo_root, &name)?;
+                let real = target.path.clone();
+                reservation = Some(target);
+                real
+            }
+            #[cfg(not(unix))]
             volume::unique_child(&repo_root, &name)
         };
         let reason = volume::volume_lock_reason(&v.name);
@@ -528,8 +613,37 @@ impl Placement {
             real,
             repo_root,
             args,
+            #[cfg(unix)]
+            reservation,
             _volume_lock: volume_lock,
         })
+    }
+
+    fn has_checkout(&self, outcome: &CheckoutOutcome, cwd: &Path) -> bool {
+        #[cfg(not(unix))]
+        let _ = cwd;
+        match outcome {
+            CheckoutOutcome::Populated(_) => true,
+            CheckoutOutcome::Unpopulated(_) => false,
+            CheckoutOutcome::Delegated(status) if status.success() => true,
+            #[cfg(unix)]
+            CheckoutOutcome::Delegated(status)
+                if status.code().is_some()
+                    && self
+                        .reservation
+                        .as_ref()
+                        .is_some_and(AliasTarget::still_owns_path)
+                    && self.real.join(".git").is_file() =>
+            {
+                let real = util::canon(&self.real);
+                git::list_worktrees(cwd).is_ok_and(|worktrees| {
+                    worktrees
+                        .iter()
+                        .any(|w| !w.is_main && !w.prunable && util::canon(&w.path) == real)
+                })
+            }
+            CheckoutOutcome::Delegated(_) => false,
+        }
     }
 
     fn finish(&self, v: &Volume, quiet: bool) -> Result<()> {
@@ -561,7 +675,7 @@ impl Placement {
     }
 }
 
-fn delegate(a: &AddArgs, cwd: &Path, why: &str) -> Result<i32> {
+fn delegate(a: &AddArgs, cwd: &Path, why: &str) -> Result<CheckoutOutcome> {
     if !a.quiet {
         eprintln!("sharetree: {why}; running plain `git worktree add`");
     }
@@ -571,8 +685,7 @@ fn delegate(a: &AddArgs, cwd: &Path, why: &str) -> Result<i32> {
     }
     args.extend(["worktree".into(), "add".into()]);
     args.extend(a.git_args.iter().cloned());
-    let st = git::run_inherit(cwd, &args)?;
-    Ok(st.code().unwrap_or(1))
+    git::run_inherit(cwd, &args).map(CheckoutOutcome::Delegated)
 }
 
 #[cfg(any(unix, windows))]
@@ -588,7 +701,7 @@ mod engine {
 
     use anyhow::{bail, Context, Result};
 
-    use super::{delegate, AddArgs, CloneProbe, DEFAULT_MIN_SIZE};
+    use super::{delegate, AddArgs, CheckoutOutcome, CloneProbe, DEFAULT_MIN_SIZE};
     use crate::attrs;
     use crate::git::{self, Entry, Tree, MODE_EXEC};
     use crate::index;
@@ -755,9 +868,9 @@ mod engine {
         let sa = base.relocated(&seed, Some(volume::SEED_LOCK_REASON));
         let t = Instant::now();
         let probe = CloneProbe::at(&seed, true, trace);
-        let code = probe.create(&sa, cwd, &seed, None, trace)?;
+        let outcome = probe.create(&sa, cwd, &seed, None, trace)?;
         trace.phase("seed", t);
-        if code != 0 {
+        if outcome.code() != 0 {
             bail!("creating the seed checkout {} failed", seed.display());
         }
         Ok(seed)
@@ -770,7 +883,7 @@ mod engine {
         anchor: &Path,
         preferred_donor: Option<&Path>,
         trace: &Trace,
-    ) -> Result<i32> {
+    ) -> Result<CheckoutOutcome> {
         let dest_arg = a.path.as_ref().expect("checked by caller");
         let dev =
             util::device_id(anchor).context("cannot identify the destination's filesystem")?;
@@ -867,7 +980,7 @@ mod engine {
         });
         let status = status?;
         if !status.success() {
-            return Ok(status.code().unwrap_or(1));
+            return Ok(CheckoutOutcome::Unpopulated(status.code().unwrap_or(1)));
         }
         let mut lifecycle = Lifecycle::Planned.advance(Lifecycle::Registered)?;
         trace.phase("register+scan target", t);
@@ -897,7 +1010,7 @@ mod engine {
             Ok((status, _, _)) => {
                 let _ = lifecycle.advance(Lifecycle::RolledBack);
                 rollback_registration(cwd, dest);
-                return Ok(status.code().unwrap_or(1));
+                return Ok(CheckoutOutcome::Unpopulated(status.code().unwrap_or(1)));
             }
             Err(e) => {
                 let _ = lifecycle.advance(Lifecycle::RolledBack);
@@ -939,7 +1052,12 @@ mod engine {
             match &report.donor {
                 Some(donor) if report.verified > 0 || report.planned == 0 => {
                     #[cfg(unix)]
-                    crate::warm::run(donor, dest, &wts, a.quiet, trace)?;
+                    if let Err(err) = crate::warm::run(donor, dest, &wts, a.quiet, trace) {
+                        if hook_code == 0 {
+                            return Err(err);
+                        }
+                        eprintln!("sharetree: warning: --warm failed: {err:#}");
+                    }
                     #[cfg(not(unix))]
                     {
                         let _ = (donor, &wts);
@@ -950,7 +1068,7 @@ mod engine {
             }
         }
         let _ = lifecycle.advance(Lifecycle::Completed)?;
-        Ok(hook_code)
+        Ok(CheckoutOutcome::Populated(hook_code))
     }
 
     fn rollback_registration(cwd: &Path, dest: &Path) {

@@ -38,12 +38,25 @@ SUFFIXES = {
 }
 COMMENT_TYPES = {"comment", "line_comment", "block_comment"}
 WORKFLOW_EXPRESSION = re.compile(rb"\$\{\{.*?\}\}", re.DOTALL)
+MATRIX_OS_EXPRESSION = re.compile(r"\$\{\{\s*matrix\.os\s*\}\}")
+POWERSHELL_REQUIRES = re.compile(rb"#requires[ \t]+-([a-z]+)(?=[ \t\r:]|$)", re.IGNORECASE)
+POWERSHELL_REQUIREMENTS = (
+    b"assembly",
+    b"modules",
+    b"psedition",
+    b"pssnapin",
+    b"runasadministrator",
+    b"shellid",
+    b"version",
+)
+POWERSHELL_EXPANDABLE_STRINGS = {"expandable_here_string_literal", "expandable_string_literal"}
 
 
 @dataclass(frozen=True)
 class Comment:
     path: str
     line: int
+    column: int
     contents: bytes
     full_lines: frozenset[int]
 
@@ -67,11 +80,29 @@ def language(path):
     return SUFFIXES.get(PurePosixPath(path).suffix)
 
 
+def is_powershell_comment(node):
+    parent = node.parent
+    if parent.type == "expandable_here_string_literal":
+        return False
+    directive = POWERSHELL_REQUIRES.match(node.text)
+    if not directive or not any(
+        parameter.startswith(directive[1].lower()) for parameter in POWERSHELL_REQUIREMENTS
+    ):
+        return True
+    while parent is not None:
+        if parent.type in POWERSHELL_EXPANDABLE_STRINGS:
+            return True
+        parent = parent.parent
+    return False
+
+
 def syntax_comments(source, kind):
     remaining = [PARSERS[kind].parse(source).root_node]
     while remaining:
         node = remaining.pop()
         if node.type in COMMENT_TYPES:
+            if kind == "pwsh" and not is_powershell_comment(node):
+                continue
             yield node.start_point, node.end_point, node.start_byte, node.end_byte
         else:
             remaining.extend(reversed(node.children))
@@ -110,6 +141,7 @@ def source_comments(path, source, kind, *, line_offset=0, shebang=False, masked=
         yield Comment(
             path,
             start_row + line_offset + 1,
+            start_col,
             source[start:end].rstrip(b"\n"),
             frozenset(full_lines),
         )
@@ -125,6 +157,24 @@ def default_shell(mapping):
     return fields(fields(mapping.get("defaults")).get("run")).get("shell")
 
 
+def runner_shells(job):
+    runner = job.get("runs-on")
+    labels = [runner]
+    if isinstance(runner, yaml.ScalarNode) and MATRIX_OS_EXPRESSION.fullmatch(runner.value):
+        matrix = fields(fields(job.get("strategy")).get("matrix"))
+        axis = matrix.get("os")
+        include = matrix.get("include")
+        labels = list(axis.value) if isinstance(axis, yaml.SequenceNode) else []
+        if isinstance(include, yaml.SequenceNode):
+            labels.extend(fields(row).get("os") for row in include.value)
+    shells = {
+        "pwsh" if label.value.lower().startswith("windows-") else "bash"
+        for label in labels
+        if isinstance(label, yaml.ScalarNode)
+    }
+    return sorted(shells) or ["bash"]
+
+
 def workflow_scripts(path, source):
     workflow = fields(yaml.compose(source))
     workflow_shell = default_shell(workflow)
@@ -133,27 +183,29 @@ def workflow_scripts(path, source):
         steps = job_fields.get("steps")
         if not isinstance(steps, yaml.SequenceNode):
             continue
-        runner = job_fields.get("runs-on")
-        windows = isinstance(runner, yaml.ScalarNode) and runner.value.startswith("windows-")
+        implicit_shells = runner_shells(job_fields)
         for step in steps.value:
             step_fields = fields(step)
             run = step_fields.get("run")
             if not isinstance(run, yaml.ScalarNode):
                 continue
             shell = step_fields.get("shell") or default_shell(job_fields) or workflow_shell
-            kind = shell.value.split()[0] if shell else "pwsh" if windows else "bash"
-            if kind in {"sh", "bash"}:
-                kind = "bash"
-            elif kind in {"powershell", "pwsh"}:
-                kind = "pwsh"
-            elif kind not in {"python"}:
-                raise ValueError(
-                    f"{path}:{run.start_mark.line + 1}: comment lint does not support shell {kind!r}"
-                )
+            kinds = implicit_shells
+            if shell:
+                kind = shell.value.split()[0]
+                kind = {"sh": "bash", "powershell": "pwsh"}.get(kind, kind)
+                if kind not in {"bash", "pwsh", "python"}:
+                    raise ValueError(
+                        f"{path}:{run.start_mark.line + 1}: comment lint does not support shell {kind!r}"
+                    )
+                kinds = [kind]
             data = run.value.encode()
             masked = WORKFLOW_EXPRESSION.sub(lambda match: re.sub(rb"[^\n]", b"x", match[0]), data)
             line_offset = run.start_mark.line + (run.style in {"|", ">"})
-            yield from source_comments(path, data, kind, line_offset=line_offset, masked=masked)
+            found = set()
+            for kind in kinds:
+                found.update(source_comments(path, data, kind, line_offset=line_offset, masked=masked))
+            yield from sorted(found, key=lambda comment: (comment.line, comment.column, comment.contents))
 
 
 def comments(ref=None):

@@ -35,6 +35,7 @@ fn init_repo(root: &Path, config: &Path, contents: &[u8]) -> PathBuf {
     let repo = root.join("repo");
 
     run(root, config, "git", &["init", "-q", "repo"]);
+    fs::write(repo.join(".git/info/attributes"), b"data.bin -text\n").unwrap();
     fs::write(repo.join("data.bin"), contents).unwrap();
     run(&repo, config, "git", &["add", "data.bin"]);
     run(

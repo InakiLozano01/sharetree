@@ -35,6 +35,7 @@ fn init_repo(root: &Path, config: &Path, contents: &[u8]) -> PathBuf {
     let repo = root.join("repo");
 
     run(root, config, "git", &["init", "-q", "repo"]);
+    fs::write(repo.join(".git/info/attributes"), b"data.bin -text\n").unwrap();
     fs::write(repo.join("data.bin"), contents).unwrap();
     run(&repo, config, "git", &["add", "data.bin"]);
     run(
@@ -132,7 +133,7 @@ fn refs_worktree_uses_verified_clones_and_keeps_edits_isolated() {
         &repo,
         &config,
         env!("CARGO_BIN_EXE_sharetree"),
-        &["add", "--windows-clone", "--detach", "../cloned"],
+        &["add", "--windows-clone", "--detach", "-v", "../cloned"],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

@@ -55,8 +55,13 @@ remove_image_fixture() {
         return 1
     fi
     remove_mount "$mount_dir" "$attached" "$filesystem" || return
-    if [[ -n $attached ]]; then
-        sudo losetup --detach -- "$attached" || return
+    remaining=$(owned_loop) || return
+    if [[ -n $remaining ]]; then
+        if [[ $remaining != "$attached" ]]; then
+            fail "Loop device changed for $image: $remaining"
+            return 1
+        fi
+        sudo losetup --detach "$remaining" || return
         sudo udevadm settle --timeout=10 || return
         remaining=$(owned_loop) || return
         if [[ -n $remaining ]]; then

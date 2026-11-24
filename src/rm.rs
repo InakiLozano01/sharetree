@@ -112,7 +112,8 @@ pub(crate) fn registered_admin(common: &Path, path: &Path) -> Result<Option<Path
         };
         let target = admin.join(decode_git_path(git::trim_nl(&link), &gitdir)?);
         if target.file_name().is_some_and(|name| name == ".git")
-            && checkout_path(target.parent().context("missing checkout path")?)? == path
+            && checkout_path(target.parent().context("missing checkout path")?)
+                .is_ok_and(|checkout| checkout == path)
         {
             validate_admin(common, &admin)?;
             if registered.replace(admin).is_some() {
@@ -422,13 +423,9 @@ pub fn run(args: &[OsString]) -> Result<i32> {
     let link = link.as_ref();
     let common = git::common_dir(&cwd)?;
     let wts = git::list_worktrees(&cwd)?;
-    let mut matching = Vec::new();
-    for w in &wts {
-        if checkout_path(&w.path)? == target {
-            matching.push(w);
-        }
-    }
-    let mut matches = matching.into_iter();
+    let mut matches = wts
+        .iter()
+        .filter(|w| checkout_path(&w.path).is_ok_and(|path| path == target));
     let wt = matches.next();
     if matches.next().is_some() {
         bail!(

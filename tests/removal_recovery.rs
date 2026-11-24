@@ -159,6 +159,35 @@ fn rm_works_when_an_unrelated_registration_has_a_file_as_its_parent() {
 }
 
 #[test]
+fn rm_skips_an_unrelated_registration_with_an_unresolvable_checkout_path() {
+    let sb = Sandbox::home();
+    let repo = sb.repo("main", &[]);
+    let stale = sb.p("stale/old-checkout");
+    let checkout = sb.p("checkout");
+    for path in [&stale, &checkout] {
+        sb.git(
+            &repo,
+            &["worktree", "add", "--detach", &path.to_string_lossy()],
+        );
+    }
+    fs::rename(sb.p("stale"), sb.p("saved")).unwrap();
+    symlink("stale", sb.p("stale")).unwrap();
+
+    let attempt = sb.sharetree(&repo, &["rm", "-ff", "--sync", &stale.to_string_lossy()]);
+    assert!(!attempt.status.success());
+
+    sb.sharetree_ok(&repo, &["rm", "--sync", &checkout.to_string_lossy()]);
+    assert!(!checkout.exists());
+    assert!(!repo.join(".git/worktrees/checkout").exists());
+    assert!(repo.join(".git/worktrees/old-checkout").is_dir());
+    assert!(sb.p("saved/old-checkout/big.bin").is_file());
+    assert_eq!(
+        fs::read_link(sb.p("stale")).unwrap(),
+        std::path::Path::new("stale")
+    );
+}
+
+#[test]
 fn rm_resolves_parent_components_after_symlinks() {
     let sb = Sandbox::home();
     let repo = sb.repo("main", &[]);

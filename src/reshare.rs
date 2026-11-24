@@ -72,9 +72,11 @@ pub fn run(args: &[OsString]) -> Result<i32> {
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use std::cell::OnceCell;
     use std::collections::hash_map::Entry;
     use std::collections::HashMap;
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -158,6 +160,62 @@ mod imp {
             .open(p)
     }
 
+    #[repr(C)]
+    struct BtrfsFsInfo {
+        max_id: u64,
+        num_devices: u64,
+        fsid: [u8; 16],
+        rest: [u8; 992],
+    }
+
+    const BTRFS_IOC_FS_INFO: libc::Ioctl = libc::_IOR::<BtrfsFsInfo>(0x94, 31);
+    const _: () = {
+        assert!(std::mem::size_of::<BtrfsFsInfo>() == 1024);
+        assert!(std::mem::offset_of!(BtrfsFsInfo, fsid) == 16);
+    };
+
+    fn btrfs_fsid(file: &File) -> Option<[u8; 16]> {
+        let fd = file.as_raw_fd();
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut stat) } != 0
+            || stat.f_type != libc::BTRFS_SUPER_MAGIC as _
+        {
+            return None;
+        }
+        let mut info: BtrfsFsInfo = unsafe { std::mem::zeroed() };
+        (unsafe { libc::ioctl(fd, BTRFS_IOC_FS_INFO, &mut info) } == 0).then_some(info.fsid)
+    }
+
+    fn same_filesystem(
+        first_dev: u64,
+        second_dev: u64,
+        first_fsid: impl FnOnce() -> Option<[u8; 16]>,
+        second_fsid: impl FnOnce() -> Option<[u8; 16]>,
+    ) -> bool {
+        first_dev == second_dev || first_fsid().is_some_and(|id| second_fsid() == Some(id))
+    }
+
+    fn filesystem_matcher(root: &Path, root_dev: u64) -> impl Fn(&Path, u64) -> bool + '_ {
+        let root_fsid = OnceCell::new();
+        let fsid_at = |path: &Path| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .ok()
+                .as_ref()
+                .and_then(btrfs_fsid)
+        };
+        move |path, dev| {
+            same_filesystem(
+                root_dev,
+                dev,
+                || *root_fsid.get_or_init(|| fsid_at(root)),
+                || fsid_at(path),
+            )
+        }
+    }
+
     fn same_extents(a: &File, b: &File) -> bool {
         match (linux::extents(a, false), linux::extents(b, false)) {
             (Ok(x), Ok(y)) => {
@@ -181,14 +239,14 @@ mod imp {
             None => git::toplevel(cwd)?,
         };
         let tcanon = util::canon(&target);
-        let dev = fs::metadata(&target)?.dev();
+        let on_filesystem = filesystem_matcher(&target, target.metadata()?.dev());
         let donors: Vec<PathBuf> = match &a.from {
             Some(p) => {
                 let donor = git::toplevel(&util::absolutize(p, cwd))?;
                 if util::canon(&donor) == tcanon {
                     bail!("the donor and target are the same worktree");
                 }
-                if fs::metadata(&donor)?.dev() != dev {
+                if !on_filesystem(&donor, donor.metadata()?.dev()) {
                     bail!("the donor and target must be on the same filesystem");
                 }
                 vec![donor]
@@ -196,7 +254,11 @@ mod imp {
             None => git::list_worktrees(&target)?
                 .into_iter()
                 .filter(|w| !w.bare && !w.prunable && util::canon(&w.path) != tcanon)
-                .filter(|w| fs::metadata(&w.path).is_ok_and(|m| m.dev() == dev))
+                .filter(|w| {
+                    w.path
+                        .metadata()
+                        .is_ok_and(|m| on_filesystem(&w.path, m.dev()))
+                })
                 .map(|w| w.path)
                 .collect(),
         };
@@ -242,7 +304,7 @@ mod imp {
     fn plan_all(cwd: &Path, min_size: u64, trace: &util::Trace) -> Result<(Vec<Pair>, String)> {
         let mut blobs = HashMap::new();
         let mut checkouts = 0;
-        let device = cwd.metadata()?.dev();
+        let on_filesystem = filesystem_matcher(cwd, cwd.metadata()?.dev());
         let common_dir = git::output(
             cwd,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -255,7 +317,7 @@ mod imp {
             let Ok(root) = w.path.metadata() else {
                 continue;
             };
-            if !root.is_dir() || root.dev() != device {
+            if !root.is_dir() || !on_filesystem(&w.path, root.dev()) {
                 continue;
             }
             let identity = git::output(
@@ -291,10 +353,14 @@ mod imp {
                     continue;
                 };
                 let len = m.len();
-                if !m.is_file() || m.dev() != dev || len == 0 || len < min_size {
+                if !m.is_file()
+                    || len == 0
+                    || len < min_size
+                    || (m.dev() != dev && !on_filesystem(&path, m.dev()))
+                {
                     continue;
                 }
-                match blobs.entry((dev, oid, len)) {
+                match blobs.entry((oid, len)) {
                     Entry::Vacant(entry) => {
                         entry.insert(BlobCopies {
                             first_checkout: checkouts,
@@ -313,7 +379,7 @@ mod imp {
         }
 
         let mut work = Vec::new();
-        for ((_, _, len), copies) in blobs {
+        for ((_, len), copies) in blobs {
             if copies.has_peer {
                 let first: Arc<Path> = copies.src.into();
                 let mut recent: Vec<Arc<Path>> = Vec::new();
@@ -363,6 +429,7 @@ mod imp {
                         failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
+                    let dst_fsid = OnceCell::new();
                     let mut saw_difference = false;
                     let mut accepted = false;
                     let mut confirmed = 0;
@@ -373,8 +440,13 @@ mod imp {
                             || !before.is_file()
                             || sm.len() != *len
                             || before.len() != *len
-                            || sm.dev() != before.dev()
-                            || sm.ino() == before.ino()
+                            || (sm.dev(), sm.ino()) == (before.dev(), before.ino())
+                            || !same_filesystem(
+                                before.dev(),
+                                sm.dev(),
+                                || *dst_fsid.get_or_init(|| btrfs_fsid(&df)),
+                                || btrfs_fsid(&sf),
+                            )
                         {
                             continue;
                         }

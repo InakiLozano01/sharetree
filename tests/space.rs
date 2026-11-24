@@ -68,6 +68,30 @@ fn exclusive(sb_path: &Path) -> Option<u64> {
     btrfs_exclusive(&content_paths(sb_path))
 }
 
+#[cfg(target_os = "linux")]
+fn create_btrfs_subvolume(path: &Path) -> bool {
+    let result = std::process::Command::new("btrfs")
+        .args(["subvolume", "create"])
+        .arg(path)
+        .output();
+    if result
+        .as_ref()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        && !require_btrfs()
+    {
+        eprintln!("SKIP: `btrfs subvolume create` unavailable");
+        return false;
+    }
+    let out = result.expect("run `btrfs subvolume create`");
+    assert!(
+        out.status.success(),
+        "create subvolume at {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
+
 #[test]
 fn btrfs_exclusive_bytes_are_near_zero() {
     let Some(sb) = Sandbox::btrfs() else { return };
@@ -111,10 +135,20 @@ fn btrfs_exclusive_bytes_are_near_zero() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reshare_recovers_sharing_after_git_rewrites() {
+    use std::os::unix::fs::MetadataExt;
+
     let Some(sb) = Sandbox::btrfs() else { return };
     let main = big_repo(&sb);
     let stock = sb.p("stock");
+    if !create_btrfs_subvolume(&stock) {
+        return;
+    }
+    assert_ne!(
+        main.metadata().unwrap().dev(),
+        stock.metadata().unwrap().dev()
+    );
     sb.git(
         &main,
         &[
@@ -173,24 +207,38 @@ fn reshare_recovers_sharing_after_git_rewrites() {
     let index_after = fs::read(&index_path).unwrap();
     assert_eq!(index_before, index_after);
 
-    let err = sb.sharetree_ok(&stock, &["reshare", "--from", &main.to_string_lossy()]);
+    let err = sb.sharetree_ok(&stock, &["reshare"]);
     assert!(
         err.contains("shared 0 files") && err.contains("31 already shared"),
         "{err}"
     );
+
+    let blob = stock.join("big.bin");
+    fs::write(&blob, fs::read(main.join("big.bin")).unwrap()).unwrap();
+    let measured = [blob];
+    assert!(btrfs_exclusive(&measured).unwrap() >= 300_000);
+    let err = sb.sharetree_ok(&stock, &["reshare", "--min-size", "262144"]);
+    assert!(err.contains("shared 1 files"), "{err}");
+    assert_eq!(btrfs_exclusive(&measured), Some(0));
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn reshare_all_inventories_each_checkout_once_and_recovers_sharing() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let Some(sb) = Sandbox::btrfs() else { return };
     let main = sb.repo("main", &[]);
-    let left = sb.p("left");
+    let left_volume = sb.p("left-volume");
+    if !create_btrfs_subvolume(&left_volume) {
+        return;
+    }
+    let left = left_volume.join("checkout");
     let right = sb.p("right");
     let peer_blob = bytes(701, 512 * 1024);
-    for (checkout, name) in [(&left, "left.bin"), (&right, "right.bin")] {
+    let left_seed = left_volume.join("left.bin");
+    write(&left_seed, &peer_blob);
+    for checkout in [&left, &right] {
         sb.git(
             &main,
             &[
@@ -201,16 +249,23 @@ fn reshare_all_inventories_each_checkout_once_and_recovers_sharing() {
                 checkout.to_str().unwrap(),
             ],
         );
-        write(&checkout.join(name), &peer_blob);
+    }
+    let left_blob = left.join("left.bin");
+    fs::rename(left_seed, &left_blob).unwrap();
+    let right_volume = right.join("assets");
+    assert!(create_btrfs_subvolume(&right_volume));
+    let right_blob = right_volume.join("right.bin");
+    write(&right_blob, &peer_blob);
+    let left_meta = left_blob.metadata().unwrap();
+    let right_meta = right_blob.metadata().unwrap();
+    assert_eq!(left_meta.ino(), right_meta.ino());
+    assert_ne!(left_meta.dev(), right_meta.dev());
+    for checkout in [&left, &right] {
         sb.commit_all(checkout, "different path for the same blob");
     }
     write(&main.join("untracked.bin"), &peer_blob);
 
-    let measured = [
-        left.join("big.bin"),
-        right.join("big.bin"),
-        right.join("right.bin"),
-    ];
+    let measured = [left.join("big.bin"), right.join("big.bin"), right_blob];
     let Some(before) = btrfs_exclusive(&measured) else {
         assert!(!require_btrfs(), "`btrfs filesystem du` is required");
         eprintln!("SKIP: `btrfs filesystem du` unavailable");
@@ -407,15 +462,38 @@ fn reshare_never_merges_different_content() {
 #[test]
 #[cfg(target_os = "linux")]
 fn reshare_rejects_an_explicit_donor_on_a_different_filesystem() {
+    use std::os::unix::fs::MetadataExt;
+
     let Some(donor_box) = Sandbox::tmpfs() else {
         return;
     };
     let target_box = Sandbox::home();
-    let donor = donor_box.repo("donor", &[]);
+    assert_ne!(
+        target_box.root().metadata().unwrap().dev(),
+        donor_box.root().metadata().unwrap().dev(),
+        "fixtures must be on distinct devices"
+    );
     let target = target_box.repo("target", &[]);
+    let donor = donor_box.p("donor");
+    target_box.git(
+        &target,
+        &["worktree", "add", "-q", "--detach", donor.to_str().unwrap()],
+    );
     let out = target_box.sharetree(&target, &["reshare", "--from", donor.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("same filesystem"));
+
+    let out = target_box.sharetree(&target, &["reshare"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no other worktree on the same filesystem")
+    );
+
+    let err = target_box.sharetree_ok(&target, &["reshare", "--all"]);
+    assert!(
+        err.contains("shared 0 files") && err.contains("across 1 worktree(s)"),
+        "{err}"
+    );
 }
 
 #[test]
